@@ -37,7 +37,7 @@ try:
 except:
     GROQ_API_KEY = None
 
-# Email settings (for OTP and alerts) – set in secrets if you want emails
+# Email settings
 try:
     SMTP_SERVER = st.secrets["SMTP_SERVER"]
     SMTP_PORT = int(st.secrets["SMTP_PORT"])
@@ -45,32 +45,90 @@ try:
     SMTP_PASSWORD = st.secrets["SMTP_PASSWORD"]
 except:
     SMTP_SERVER = None
-    st.sidebar.warning("Email settings not configured. Alerts will be disabled.")
 
-# ---------- Custom CSS for Industrial Theme ----------
+# ---------- Custom CSS for Corporate Light Theme ----------
 st.markdown("""
 <style>
+    /* Global styles */
     .stApp {
-        background-color: #0a0c10;
-        color: #e0e0e0;
+        background-color: #f5f7fb;
     }
     .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        background: linear-gradient(135deg, #4caf50, #ff9800);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        margin-bottom: 2rem;
+        font-size: 2rem;
+        font-weight: 600;
+        color: #1e3a8a;
+        margin-bottom: 1rem;
+        border-left: 4px solid #3b82f6;
+        padding-left: 1rem;
     }
-    .risk-critical { color: #f44336; font-weight: bold; }
-    .risk-high { color: #ff9800; font-weight: bold; }
-    .risk-medium { color: #ffc107; }
-    .risk-low { color: #4caf50; }
-    .stMetric {
-        background-color: #1e1e2e;
-        border-radius: 10px;
-        padding: 0.5rem;
+    .metric-card {
+        background: white;
+        border-radius: 12px;
+        padding: 1rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        border: 1px solid #e5e7eb;
+        transition: all 0.2s;
+    }
+    .metric-card:hover {
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+    }
+    .stat-value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        color: #111827;
+    }
+    .stat-label {
+        font-size: 0.85rem;
+        color: #6b7280;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .risk-critical {
+        color: #dc2626;
+        font-weight: 600;
+    }
+    .risk-high {
+        color: #f97316;
+        font-weight: 600;
+    }
+    .risk-medium {
+        color: #eab308;
+        font-weight: 600;
+    }
+    .risk-low {
+        color: #10b981;
+        font-weight: 600;
+    }
+    .stButton > button {
+        background-color: #3b82f6;
+        color: white;
+        border-radius: 6px;
+        border: none;
+        padding: 0.5rem 1rem;
+        font-weight: 500;
+    }
+    .stButton > button:hover {
+        background-color: #2563eb;
+    }
+    .stTextInput > div > input, .stTextArea > div > textarea {
+        border-radius: 6px;
+        border: 1px solid #e5e7eb;
+    }
+    .stDataFrame {
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid #e5e7eb;
+    }
+    .css-1d391kg {
+        background-color: white;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        border: 1px solid #e5e7eb;
+    }
+    hr {
+        margin: 1rem 0;
+        border-color: #e5e7eb;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -139,7 +197,7 @@ def safe_float(x):
 # ---------- Authentication ----------
 def login_page():
     st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
-    st.subheader("Login / Register")
+    st.subheader("Secure Access")
     tab1, tab2 = st.tabs(["Login", "Register"])
     
     with tab1:
@@ -370,7 +428,6 @@ def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
 
 # ---------- Alert Check ----------
 def check_new_alerts(user_email):
-    """Check for new vulnerabilities for user's assets and send email alerts if any new CVEs are found."""
     assets = get_user_assets(user_email)
     if not assets:
         return False, "No assets to check."
@@ -382,18 +439,14 @@ def check_new_alerts(user_email):
     last_check = row[0] if row else None
     last_check_dt = datetime.fromisoformat(last_check) if last_check else None
 
-    # Fetch KEV catalog once
     kev_list = fetch_kev_catalog()
     new_alerts = []
     for asset_id, asset_name, asset_type, location, _ in assets:
-        # Search NVD for this asset (last 30 days if we want only recent, but we'll compare with existing alerts)
         cve_list = search_nvd(asset_name, max_results=20)
         for item in cve_list:
             cve_id = item["cve"]
-            # Check if already alerted
             c.execute("SELECT id FROM alerts WHERE email=? AND asset_id=? AND cve_id=?", (user_email, asset_id, cve_id))
             if not c.fetchone():
-                # New CVE
                 enriched = enrich_cve(cve_id, kev_list)
                 if enriched:
                     new_alerts.append({
@@ -403,13 +456,10 @@ def check_new_alerts(user_email):
                         "kev": enriched["kev"],
                         "description": enriched["description"][:200]
                     })
-                    # Record alert
                     c.execute("INSERT INTO alerts (email, asset_id, cve_id, sent_at, status) VALUES (?, ?, ?, ?, ?)",
                               (user_email, asset_id, cve_id, datetime.now(), "sent"))
-        # Small delay to avoid rate limiting
         time.sleep(0.5)
 
-    # Send email if any new alerts
     if new_alerts:
         subject = f"New OT Vulnerability Alerts for Your Assets"
         body = f"Dear user,\n\nWe found {len(new_alerts)} new vulnerabilities affecting your assets:\n\n"
@@ -417,19 +467,17 @@ def check_new_alerts(user_email):
             body += f"- {alert['asset']}: {alert['cve']} (CVSS: {alert['cvss']}, KEV: {alert['kev']})\n  {alert['description']}\n\n"
         body += "\nPlease log in to your dashboard for more details.\n\nOT Vulnerability Intelligence Platform"
         send_email(user_email, subject, body)
-        # Update last check
         c.execute("UPDATE users SET last_alert_check=? WHERE email=?", (datetime.now().isoformat(), user_email))
         conn.commit()
         conn.close()
         return True, f"Found {len(new_alerts)} new vulnerabilities. Email alert sent."
     else:
-        # Update last check even if none found
         c.execute("UPDATE users SET last_alert_check=? WHERE email=?", (datetime.now().isoformat(), user_email))
         conn.commit()
         conn.close()
         return False, "No new vulnerabilities found."
 
-# ---------- LLM Agent ----------
+# ---------- LLM Agent Tools ----------
 TOOLS = [
     {
         "type": "function",
@@ -480,6 +528,7 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
     if tool_name == "search_vulnerabilities":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
+        # Convert to int in case LLM sends string
         try:
             max_results = int(max_results)
         except:
@@ -532,7 +581,7 @@ def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[st
 
     system_prompt = {
         "role": "system",
-        "content": "You are an OT/ICS cybersecurity analyst. Use tools to gather data. Consider OT/ICS implications."
+        "content": "You are an OT/ICS cybersecurity analyst. Use tools to gather data. When using tools, ensure numeric parameters are integers (no quotes). Consider OT/ICS implications in your answers."
     }
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
@@ -581,7 +630,6 @@ def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[st
 
 # ---------- Dashboard Functions ----------
 def analyze_assets(user_email):
-    """Fetch all assets, search NVD for each, enrich with EPSS/KEV, return DataFrame and summary stats."""
     assets = get_user_assets(user_email)
     if not assets:
         return pd.DataFrame(), {}
@@ -602,11 +650,9 @@ def analyze_assets(user_email):
     if df.empty:
         return df, {}
 
-    # Convert numeric columns
     df["cvss_score"] = df["cvss_score"].apply(safe_float)
     df["epss"] = df["epss"].fillna(0).apply(safe_float)
 
-    # Risk categories
     df["risk"] = df.apply(lambda x: "Critical" if x["kev"] else ("High" if x["cvss_score"] > 7 else ("Medium" if x["cvss_score"] > 4 else "Low")), axis=1)
 
     stats = {
@@ -623,29 +669,25 @@ def analyze_assets(user_email):
 
 # ---------- Main App ----------
 def main():
-    # Check authentication
     if "logged_in" not in st.session_state or not st.session_state.logged_in:
         login_page()
         return
 
-    # Logged in view
     user_email = st.session_state.user_email
 
     # Sidebar
     with st.sidebar:
-        st.image("https://cdn-icons-png.flaticon.com/512/512/512.png", width=60)  # placeholder icon
-        st.markdown(f"**User:** {user_email}")
+        st.markdown("### 🏭 Navigation")
+        page = st.radio("", ["Dashboard", "Asset Manager", "AI Agent"])
+        st.markdown("---")
+        st.markdown(f"**Logged in as**  \n{user_email}")
         if st.button("Logout"):
             logout()
-        st.markdown("---")
-        st.markdown("### 🏭 Navigation")
-        page = st.radio("Go to", ["Dashboard", "Asset Manager", "AI Agent"])
 
-    # Dashboard
     if page == "Dashboard":
-        st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Dashboard</div>', unsafe_allow_html=True)
+        st.markdown('<div class="main-header">📊 OT Vulnerability Dashboard</div>', unsafe_allow_html=True)
 
-        # On login, automatically check for new alerts
+        # On login, automatically check for new alerts (once per session)
         if "alert_checked" not in st.session_state:
             with st.spinner("Checking for new vulnerabilities..."):
                 _, msg = check_new_alerts(user_email)
@@ -653,14 +695,13 @@ def main():
                 st.session_state.alert_checked = True
 
         # Manual check button
-        col1, col2 = st.columns([1, 4])
+        col1, col2 = st.columns([1, 5])
         with col1:
             if st.button("🔄 Check for New Alerts"):
                 with st.spinner("Checking..."):
                     sent, msg = check_new_alerts(user_email)
                     st.success(msg)
 
-        # Load asset data
         with st.spinner("Analyzing your assets..."):
             df, stats = analyze_assets(user_email)
 
@@ -671,13 +712,13 @@ def main():
         # Metrics row
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Vulnerabilities", stats["total_vulns"])
+            st.markdown('<div class="metric-card"><div class="stat-label">Total Vulnerabilities</div><div class="stat-value">{}</div></div>'.format(stats["total_vulns"]), unsafe_allow_html=True)
         with col2:
-            st.metric("Critical/High", stats["critical_count"] + stats["high_count"])
+            st.markdown('<div class="metric-card"><div class="stat-label">Critical/High</div><div class="stat-value">{}</div></div>'.format(stats["critical_count"] + stats["high_count"]), unsafe_allow_html=True)
         with col3:
-            st.metric("Average CVSS", f"{stats['avg_cvss']:.1f}")
+            st.markdown('<div class="metric-card"><div class="stat-label">Average CVSS</div><div class="stat-value">{:.1f}</div></div>'.format(stats["avg_cvss"]), unsafe_allow_html=True)
         with col4:
-            st.metric("Assets Affected", stats["assets_affected"])
+            st.markdown('<div class="metric-card"><div class="stat-label">Assets Affected</div><div class="stat-value">{}</div></div>'.format(stats["assets_affected"]), unsafe_allow_html=True)
 
         # Severity distribution chart
         st.subheader("Risk Severity Distribution")
@@ -686,22 +727,22 @@ def main():
             "Count": [stats["critical_count"], stats["high_count"], stats["medium_count"], stats["low_count"]]
         })
         fig = px.bar(severity_data, x="Severity", y="Count", color="Severity",
-                     color_discrete_map={"Critical": "#f44336", "High": "#ff9800", "Medium": "#ffc107", "Low": "#4caf50"},
-                     title="Vulnerabilities by Severity")
+                     color_discrete_map={"Critical": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"},
+                     title="")
         st.plotly_chart(fig, use_container_width=True)
 
         # CVSS vs EPSS scatter plot
         st.subheader("CVSS vs EPSS Risk Matrix")
         fig2 = px.scatter(df, x="cvss_score", y="epss", hover_name="cve", color="risk",
                           color_discrete_map={"Critical": "red", "High": "orange", "Medium": "yellow", "Low": "green"},
-                          title="Risk Matrix")
+                          title="")
         st.plotly_chart(fig2, use_container_width=True)
 
         # Top assets by vulnerability count
-        st.subheader("Assets with Most Vulnerabilities")
+        st.subheader("Top Assets by Vulnerability Count")
         asset_counts = df.groupby("asset").size().reset_index(name="count")
         fig3 = px.bar(asset_counts.sort_values("count", ascending=False).head(10),
-                      x="asset", y="count", title="Top 10 Assets by Vulnerability Count")
+                      x="asset", y="count", title="")
         st.plotly_chart(fig3, use_container_width=True)
 
         # Detailed table
@@ -712,14 +753,13 @@ def main():
         st.dataframe(display_df, use_container_width=True)
 
     elif page == "Asset Manager":
-        st.header("📦 Asset Manager")
-        st.markdown("Add, import, or manage your OT assets.")
+        st.markdown('<div class="main-header">📦 Asset Manager</div>', unsafe_allow_html=True)
+        st.markdown("Manage your OT assets – add manually or import from Excel/CSV.")
 
-        # Add asset manually
         with st.expander("➕ Add Asset Manually"):
             col1, col2, col3 = st.columns(3)
             with col1:
-                asset_name = st.text_input("Asset Name (e.g., Siemens S7-1200)")
+                asset_name = st.text_input("Asset Name")
             with col2:
                 asset_type = st.selectbox("Asset Type", ["PLC", "RTU", "HMI", "SCADA", "Gateway", "Other"])
             with col3:
@@ -732,7 +772,6 @@ def main():
                 else:
                     st.warning("Please enter an asset name.")
 
-        # Import from Excel/CSV
         with st.expander("📎 Import from Excel/CSV"):
             uploaded_file = st.file_uploader("Choose file", type=["xlsx", "csv"])
             if uploaded_file:
@@ -741,7 +780,6 @@ def main():
                         df = pd.read_csv(uploaded_file)
                     else:
                         df = pd.read_excel(uploaded_file)
-                    # Assume first column is asset name, second optional type, third location
                     for idx, row in df.iterrows():
                         name = str(row.iloc[0]).strip()
                         if name and name != "nan":
@@ -753,24 +791,23 @@ def main():
                 except Exception as e:
                     st.error(f"Error reading file: {e}")
 
-        # List current assets
         st.subheader("Your Assets")
         assets = get_user_assets(user_email)
         if not assets:
-            st.info("No assets yet.")
+            st.info("No assets yet. Add some using the forms above.")
         else:
             for asset_id, asset_name, asset_type, location, created_at in assets:
                 col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 2, 1])
                 col1.write(f"**{asset_name}**")
                 col2.write(asset_type)
-                col3.write(location)
+                col3.write(location if location else "—")
                 col4.write(created_at[:10])
                 if col5.button("Delete", key=f"del_{asset_id}"):
                     delete_asset(asset_id)
                     st.rerun()
 
     elif page == "AI Agent":
-        st.header("🤖 OT Vulnerability Agent")
+        st.markdown('<div class="main-header">🤖 OT Vulnerability Agent</div>', unsafe_allow_html=True)
         st.markdown("Ask any question about OT/ICS vulnerabilities. The agent can search NVD, fetch KEV, and get ICS advisories.")
 
         if not GROQ_API_KEY:
