@@ -309,14 +309,6 @@ def get_asset_by_id(asset_id):
     conn.close()
     return row
 
-def get_asset_id_by_name(email, asset_name):
-    conn = sqlite3.connect('ot_platform.db')
-    c = conn.cursor()
-    c.execute("SELECT id FROM assets WHERE email=? AND asset_name=?", (email, asset_name))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
 # ---------- Connection Management ----------
 def add_connection(email, source_id, target_id, rel_type):
     if source_id == target_id:
@@ -366,7 +358,7 @@ def build_network_graph(email):
         G.add_edge(src, tgt, relationship=rel_type)
     return G
 
-# ---------- Vulnerability Analysis Functions (with lookback) ----------
+# ---------- Vulnerability Analysis Functions ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nvd_cve(cve_id: str) -> Optional[Dict]:
     url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
@@ -689,8 +681,7 @@ When using tools, ensure numeric parameters are integers (no quotes). Consider O
     return final_message, conversation_history
 
 def execute_tool(tool_name: str, arguments: Dict) -> str:
-    # This function needs access to the current lookback. We'll pass it via session_state.
-    # However, to avoid a circular dependency, we'll read from st.session_state inside the function.
+    # This function uses the current lookback from session state
     lookback_months = st.session_state.get("lookback_months", 24)
     if tool_name == "search_vulnerabilities":
         keyword = arguments["keyword"]
@@ -748,7 +739,7 @@ def fetch_ics_advisories() -> List[Dict]:
         pass
     return []
 
-# ---------- Dashboard Functions (with lookback) ----------
+# ---------- Dashboard Functions ----------
 def analyze_assets(user_email, lookback_months):
     assets = get_user_assets(user_email)
     if not assets:
@@ -918,11 +909,9 @@ def main():
                                     help="How many months back to search for CVEs")
         if "lookback_months" not in st.session_state or st.session_state.lookback_months != lookback_months:
             st.session_state.lookback_months = lookback_months
-            # Clear cache to force refresh
             st.cache_data.clear()
             st.rerun()
 
-    # If no email set, show prompt and exit
     if "user_email" not in st.session_state or not st.session_state.user_email:
         st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
         st.info("👋 Please enter your email in the sidebar to begin.")
@@ -931,34 +920,32 @@ def main():
     user_email = st.session_state.user_email
     lookback = st.session_state.lookback_months
 
-    # Sidebar navigation (only shown when email is set)
     with st.sidebar:
         st.markdown("---")
         st.markdown("### 🏭 Navigation")
         page = st.radio("", ["Dashboard", "Asset Manager", "Network Architecture", "AI Agent"])
 
+    # ---------- Dashboard ----------
     if page == "Dashboard":
         st.markdown('<div class="main-header">📊 OT Vulnerability Dashboard</div>', unsafe_allow_html=True)
 
-        # Dashboard action buttons
         col_actions = st.columns([1,1,1])
         with col_actions[0]:
-            if st.button("🔄 Refresh Data", help="Re‑fetch vulnerabilities for all assets"):
+            if st.button("🔄 Refresh Data"):
                 st.cache_data.clear()
                 st.rerun()
         with col_actions[1]:
-            if st.button("📧 Check Alerts", help="Manually check for new vulnerabilities and send email"):
+            if st.button("📧 Check Alerts"):
                 with st.spinner("Checking..."):
                     sent, msg = check_new_alerts(user_email, lookback)
                     st.success(msg)
         with col_actions[2]:
-            if st.button("🗑️ Clear All Assets", help="Delete all your assets and connections"):
+            if st.button("🗑️ Clear All Assets"):
                 if st.checkbox("Confirm delete all assets?"):
                     delete_all_assets(user_email)
                     st.success("All assets and connections deleted.")
                     st.rerun()
 
-        # On first load of the session, check for new alerts (only once)
         if "alert_checked" not in st.session_state:
             with st.spinner("Checking for new vulnerabilities..."):
                 _, msg = check_new_alerts(user_email, lookback)
@@ -983,15 +970,14 @@ def main():
         # Metrics row
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.markdown('<div class="metric-card"><div class="stat-label">Total Vulnerabilities</div><div class="stat-value">{}</div></div>'.format(stats["total_vulns"]), unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><div class="stat-label">Total Vulnerabilities</div><div class="stat-value">{stats["total_vulns"]}</div></div>', unsafe_allow_html=True)
         with col2:
-            st.markdown('<div class="metric-card"><div class="stat-label">Critical/High</div><div class="stat-value">{}</div></div>'.format(stats["critical_count"] + stats["high_count"]), unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><div class="stat-label">Critical/High</div><div class="stat-value">{stats["critical_count"] + stats["high_count"]}</div></div>', unsafe_allow_html=True)
         with col3:
-            st.markdown('<div class="metric-card"><div class="stat-label">Average CVSS</div><div class="stat-value">{:.1f}</div></div>'.format(stats["avg_cvss"]), unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><div class="stat-label">Average CVSS</div><div class="stat-value">{stats["avg_cvss"]:.1f}</div></div>', unsafe_allow_html=True)
         with col4:
-            st.markdown('<div class="metric-card"><div class="stat-label">Assets Affected</div><div class="stat-value">{}</div></div>'.format(stats["assets_affected"]), unsafe_allow_html=True)
+            st.markdown(f'<div class="metric-card"><div class="stat-label">Assets Affected</div><div class="stat-value">{stats["assets_affected"]}</div></div>', unsafe_allow_html=True)
 
-        # Severity distribution chart
         st.subheader("Risk Severity Distribution")
         severity_data = pd.DataFrame({
             "Severity": ["Critical", "High", "Medium", "Low"],
@@ -1002,14 +988,12 @@ def main():
                      title="")
         st.plotly_chart(fig, use_container_width=True)
 
-        # CVSS vs EPSS scatter plot
         st.subheader("CVSS vs EPSS Risk Matrix")
         fig2 = px.scatter(df, x="cvss_score", y="epss", hover_name="cve", color="risk",
                           color_discrete_map={"Critical": "red", "High": "orange", "Medium": "yellow", "Low": "green"},
                           title="")
         st.plotly_chart(fig2, use_container_width=True)
 
-        # Top assets by vulnerability count
         st.subheader("Top Assets by Vulnerability Count")
         asset_counts = df.groupby("asset").size().reset_index(name="count")
         fig3 = px.bar(asset_counts.sort_values("count", ascending=False).head(10),
@@ -1043,7 +1027,6 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                         explanation = simple_llm_query(prompt)
                         st.write(explanation)
 
-        # Latest relevant CVEs
         st.subheader("Latest Relevant CVEs for Your Assets")
         latest_cves = get_latest_cves_for_assets(user_email, lookback, limit=10)
         if latest_cves:
@@ -1058,7 +1041,6 @@ Assets and their top vulnerabilities (EPSS > 0.5):
         else:
             st.info(f"No CVEs found for your assets in the last {lookback} months.")
 
-        # Detailed table
         st.subheader("Detailed Vulnerability List")
         display_df = df[["asset", "cve", "cvss_score", "epss", "risk", "description"]].copy()
         display_df["cvss_score"] = pd.to_numeric(display_df["cvss_score"], errors="coerce")
@@ -1067,20 +1049,328 @@ Assets and their top vulnerabilities (EPSS > 0.5):
         display_df["epss"] = display_df["epss"].round(4)
         st.dataframe(display_df, use_container_width=True)
 
+    # ---------- Asset Manager ----------
     elif page == "Asset Manager":
-        # [Asset Manager code – same as before, but with lookback passed to search functions if needed]
-        # For brevity, the Asset Manager code remains unchanged from the previous version.
-        # (We keep it exactly as in the earlier version, but we don't need to repeat it here.)
-        pass
+        st.markdown('<div class="main-header">📦 Asset Manager</div>', unsafe_allow_html=True)
+        st.markdown("Manage your OT assets and asset types.")
 
+        # Asset type management
+        with st.expander("🏷️ Manage Asset Types"):
+            col1, col2 = st.columns(2)
+            with col1:
+                new_type = st.text_input("New Asset Type")
+                if st.button("Add Type"):
+                    if new_type:
+                        if add_asset_type(user_email, new_type):
+                            st.success(f"Added type '{new_type}'")
+                            st.rerun()
+                        else:
+                            st.warning("Type already exists.")
+                    else:
+                        st.warning("Enter a type name.")
+            with col2:
+                conn = sqlite3.connect('ot_platform.db')
+                c = conn.cursor()
+                c.execute("SELECT type_name FROM asset_types WHERE email=? AND is_default=0 ORDER BY type_name", (user_email,))
+                custom_types = [row[0] for row in c.fetchall()]
+                conn.close()
+                if custom_types:
+                    type_to_delete = st.selectbox("Select custom type to delete", custom_types)
+                    if st.button("Delete Type"):
+                        delete_asset_type(user_email, type_to_delete)
+                        st.success(f"Deleted type '{type_to_delete}'")
+                        st.rerun()
+                else:
+                    st.info("No custom types added yet.")
+
+        # Add asset manually
+        with st.expander("➕ Add Asset Manually"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                asset_name = st.text_input("Asset Name")
+            with col2:
+                asset_type = st.selectbox("Asset Type", get_asset_types(user_email))
+            with col3:
+                location = st.text_input("Location (optional)")
+            if st.button("Add Asset"):
+                if asset_name:
+                    added, _ = add_asset(user_email, asset_name, asset_type, location)
+                    if added:
+                        st.success(f"Added {asset_name}")
+                        st.rerun()
+                    else:
+                        st.warning(f"Asset '{asset_name}' already exists.")
+                else:
+                    st.warning("Please enter an asset name.")
+
+        # Import from Excel/CSV with column mapping
+        with st.expander("📎 Import from Excel/CSV"):
+            uploaded_file = st.file_uploader("Choose file", type=["xlsx", "csv"])
+            if uploaded_file:
+                try:
+                    if uploaded_file.name.endswith('.csv'):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+
+                    st.subheader("Preview (first 5 rows)")
+                    st.dataframe(df.head(5))
+
+                    cols = df.columns.tolist()
+                    st.markdown("**Map columns to asset fields**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        name_col = st.selectbox("Asset Name column", cols, index=0)
+                        type_col = st.selectbox("Asset Type column (optional)", ["-- Skip --"] + cols, index=0)
+                        loc_col = st.selectbox("Location column (optional)", ["-- Skip --"] + cols, index=0)
+                        id_col = st.selectbox("Asset ID column (for connections)", ["-- Skip --"] + cols, index=0)
+                    with col2:
+                        conn_col = st.selectbox("Connections column (comma‑separated asset_ids)", ["-- Skip --"] + cols, index=0)
+                        subnet_col = st.selectbox("Subnet column (optional)", ["-- Skip --"] + cols, index=0)
+                        vlan_col = st.selectbox("VLAN column (optional)", ["-- Skip --"] + cols, index=0)
+
+                    clear_connections = st.checkbox("Clear existing connections before import", value=True)
+
+                    if st.button("Import Assets"):
+                        if clear_connections:
+                            delete_all_connections(user_email)
+
+                        excel_id_to_db_id = {}
+                        existing_assets = {a[1]: a[0] for a in get_user_assets(user_email)}
+                        asset_name_to_id = existing_assets.copy()
+                        added_count = 0
+                        duplicate_count = 0
+                        type_list = get_asset_types(user_email)
+
+                        # First pass: add assets
+                        for _, row in df.iterrows():
+                            asset_name = str(row[name_col]).strip()
+                            if not asset_name or asset_name == "nan":
+                                continue
+                            if asset_name in asset_name_to_id:
+                                duplicate_count += 1
+                                if id_col != "-- Skip --" and pd.notna(row[id_col]):
+                                    excel_id = str(row[id_col]).strip()
+                                    excel_id_to_db_id[excel_id] = asset_name_to_id[asset_name]
+                                continue
+
+                            if type_col != "-- Skip --" and pd.notna(row[type_col]):
+                                asset_type = str(row[type_col]).strip()
+                                if asset_type not in type_list:
+                                    add_asset_type(user_email, asset_type)
+                                    type_list = get_asset_types(user_email)
+                            else:
+                                asset_type = "Other"
+
+                            if loc_col != "-- Skip --" and pd.notna(row[loc_col]):
+                                location = str(row[loc_col]).strip()
+                            else:
+                                location = ""
+
+                            metadata = {}
+                            if subnet_col != "-- Skip --" and pd.notna(row[subnet_col]):
+                                metadata["subnet"] = str(row[subnet_col]).strip()
+                            if vlan_col != "-- Skip --" and pd.notna(row[vlan_col]):
+                                metadata["vlan"] = str(row[vlan_col]).strip()
+                            for col in cols:
+                                if col not in [name_col, type_col, loc_col, id_col, conn_col, subnet_col, vlan_col] and pd.notna(row[col]):
+                                    metadata[col] = str(row[col]).strip()
+
+                            added, new_id = add_asset(user_email, asset_name, asset_type, location, metadata if metadata else None)
+                            if added:
+                                added_count += 1
+                                asset_name_to_id[asset_name] = new_id
+                                if id_col != "-- Skip --" and pd.notna(row[id_col]):
+                                    excel_id = str(row[id_col]).strip()
+                                    excel_id_to_db_id[excel_id] = new_id
+                            else:
+                                duplicate_count += 1
+
+                        # Second pass: create connections
+                        if conn_col != "-- Skip --":
+                            conn_added = 0
+                            conn_skipped = 0
+                            for _, row in df.iterrows():
+                                if id_col == "-- Skip --":
+                                    break
+                                excel_id = str(row[id_col]).strip()
+                                if not excel_id or excel_id == "nan":
+                                    continue
+                                source_db_id = excel_id_to_db_id.get(excel_id)
+                                if not source_db_id:
+                                    continue
+                                conn_str = str(row[conn_col]).strip()
+                                if not conn_str or conn_str == "nan":
+                                    continue
+                                target_ids = [t.strip() for t in conn_str.split(',') if t.strip()]
+                                for target_excel_id in target_ids:
+                                    target_db_id = excel_id_to_db_id.get(target_excel_id)
+                                    if target_db_id:
+                                        if add_connection(user_email, source_db_id, target_db_id, "connected"):
+                                            conn_added += 1
+                                        else:
+                                            conn_skipped += 1
+                                    else:
+                                        conn_skipped += 1
+                            st.info(f"Connections: {conn_added} added, {conn_skipped} skipped.")
+
+                        st.success(f"Imported {added_count} new assets. {duplicate_count} duplicates skipped.")
+                        st.rerun()
+
+                except Exception as e:
+                    st.error(f"Error reading file: {e}")
+
+        # List current assets
+        st.subheader("Your Assets")
+        assets = get_user_assets(user_email)
+        if not assets:
+            st.info("No assets yet. Add some using the forms above.")
+        else:
+            for asset_id, asset_name, asset_type, location, created_at in assets:
+                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 2, 1])
+                col1.write(f"**{asset_name}**")
+                col2.write(asset_type)
+                col3.write(location if location else "—")
+                col4.write(created_at[:10])
+                if col5.button("Delete", key=f"del_{asset_id}"):
+                    delete_asset(asset_id)
+                    st.rerun()
+
+    # ---------- Network Architecture ----------
     elif page == "Network Architecture":
-        # [Network Architecture code – same as before]
-        pass
+        st.markdown('<div class="main-header">🔗 Network Architecture</div>', unsafe_allow_html=True)
+        st.markdown("Define connections between your OT assets. The AI agent will use this to predict impact propagation.")
 
+        assets = get_user_assets(user_email)
+        if not assets:
+            st.warning("Please add assets first in the Asset Manager.")
+        else:
+            asset_types = list(set([a[2] for a in assets]))
+            color_palette = px.colors.qualitative.Plotly + px.colors.qualitative.Dark24
+            type_colors = {t: color_palette[i % len(color_palette)] for i, t in enumerate(asset_types)}
+            type_colors["Other"] = "#aaaaaa"
+
+            st.subheader("Network Graph")
+            if "graph_seed" not in st.session_state:
+                st.session_state.graph_seed = 42
+
+            fig = plot_network_graph(user_email, type_colors, seed=st.session_state.graph_seed)
+            if fig:
+                if st.button("🔄 Reset Layout"):
+                    st.session_state.graph_seed = random.randint(1, 10000)
+                    st.rerun()
+                st.markdown('<div class="graph-container">', unsafe_allow_html=True)
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True})
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.caption("💡 Tip: Use the toolbar to zoom, pan, and download the graph as an image.")
+            else:
+                st.info("Not enough nodes to display graph (need at least one asset).")
+
+            st.markdown("---")
+
+            # Add connection
+            with st.expander("➕ Add Connection", expanded=True):
+                col1, col2, col3 = st.columns(3)
+                asset_options = [f"{a[1]} (ID:{a[0]})" for a in assets]
+                asset_id_map = {opt: a[0] for opt, a in zip(asset_options, assets)}
+                with col1:
+                    source_opt = st.selectbox("Source Asset", asset_options, key="src_conn")
+                with col2:
+                    target_opt = st.selectbox("Target Asset", asset_options, key="tgt_conn")
+                with col3:
+                    rel_type = st.selectbox("Relationship", ["upstream", "downstream", "peer"])
+                if st.button("Create Connection", key="add_conn_btn"):
+                    src_id = asset_id_map[source_opt]
+                    tgt_id = asset_id_map[target_opt]
+                    if src_id == tgt_id:
+                        st.warning("Source and target cannot be the same.")
+                    else:
+                        success = add_connection(user_email, src_id, tgt_id, rel_type)
+                        if success:
+                            st.success("Connection added.")
+                            st.rerun()
+                        else:
+                            st.warning("Connection already exists.")
+
+            # Existing connections
+            connections = get_connections(user_email)
+            if connections:
+                st.subheader("Existing Connections")
+                conn_data = []
+                for conn_id, src_id, tgt_id, rel_type in connections:
+                    src_name = get_asset_by_id(src_id)[1] if get_asset_by_id(src_id) else "Unknown"
+                    tgt_name = get_asset_by_id(tgt_id)[1] if get_asset_by_id(tgt_id) else "Unknown"
+                    conn_data.append({"ID": conn_id, "Source": src_name, "Target": tgt_name, "Type": rel_type})
+                conn_df = pd.DataFrame(conn_data)
+                st.dataframe(conn_df, use_container_width=True)
+
+                del_id = st.number_input("Connection ID to delete", min_value=0, step=1, key="del_conn_id")
+                if st.button("Delete Connection", key="del_conn_btn"):
+                    if del_id > 0 and del_id in conn_df["ID"].values:
+                        delete_connection(del_id)
+                        st.success("Connection deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Invalid Connection ID.")
+
+                if st.button("🗑️ Delete All Connections", key="del_all_conn"):
+                    if st.checkbox("Confirm delete all connections"):
+                        delete_all_connections(user_email)
+                        st.success("All connections deleted.")
+                        st.rerun()
+            else:
+                st.info("No connections yet. Add some to model your network.")
+
+    # ---------- AI Agent ----------
     elif page == "AI Agent":
-        # [AI Agent code – same as before]
-        pass
+        st.markdown('<div class="main-header">🤖 OT Vulnerability Agent</div>', unsafe_allow_html=True)
+        st.markdown("Ask any question about OT/ICS vulnerabilities. The agent can search NVD, fetch KEV, get ICS advisories, and understand your network architecture to predict impact.")
 
-# We need to include the full Asset Manager, Network Architecture and AI Agent code again, but to keep the answer manageable,
-# I'll skip re‑writing them here. They should be the same as in the previous final version.
-# For a complete working app, combine the above with the full code from the previous answer (the one that included all tabs).
+        if not GROQ_API_KEY:
+            st.error("Groq API key not configured. AI Agent disabled.")
+        else:
+            # Build network context string for the agent (including EPSS risk)
+            network_context = ""
+            G = build_network_graph(user_email)
+            df, _ = analyze_assets(user_email, lookback)
+            asset_epss = get_asset_epss_summary(user_email, df) if not df.empty else pd.DataFrame()
+
+            if G.number_of_nodes() > 0:
+                network_context = "Network Architecture with EPSS risks:\n"
+                for node in G.nodes():
+                    node_data = G.nodes[node]
+                    asset_name = node_data['name']
+                    if not asset_epss.empty:
+                        asset_stats = asset_epss[asset_epss["asset"] == asset_name]
+                        if not asset_stats.empty:
+                            epss_info = f" (max EPSS: {asset_stats['max_epss'].iloc[0]:.3f}, risk: {asset_stats['risk_level'].iloc[0]})"
+                        else:
+                            epss_info = ""
+                    else:
+                        epss_info = ""
+                    network_context += f"- Asset {asset_name} (type:{node_data['type']}, location:{node_data['location']}){epss_info}\n"
+                network_context += "Connections:\n"
+                for edge in G.edges():
+                    src = G.nodes[edge[0]]["name"]
+                    tgt = G.nodes[edge[1]]["name"]
+                    rel = G.edges[edge].get("relationship", "connected")
+                    network_context += f"  {src} --({rel})--> {tgt}\n"
+
+            if "agent_messages" not in st.session_state:
+                st.session_state.agent_messages = []
+
+            for msg in st.session_state.agent_messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+            if prompt := st.chat_input("Ask a question..."):
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        answer, new_history = agent_query(prompt, st.session_state.agent_messages, network_context)
+                        st.markdown(answer)
+                        st.session_state.agent_messages = new_history
+
+if __name__ == "__main__":
+    main()
