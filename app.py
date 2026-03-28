@@ -7,12 +7,13 @@ import time
 import json
 import uuid
 import groq
+import base64
 from typing import Dict, List, Optional, Tuple
 
 # ---------- Page Configuration ----------
 st.set_page_config(
-    page_title="Vuln Intelligence Dashboard",
-    page_icon="🛡️",
+    page_title="OT Vulnerability Intelligence Platform",
+    page_icon="🏭",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -29,14 +30,58 @@ except:
     GROQ_API_KEY = None
     st.warning("Groq API key not found. LLM features will be disabled.")
 
+# ---------- Custom CSS for Industrial Theme ----------
+st.markdown("""
+<style>
+    /* Dark theme with industrial accents */
+    .stApp {
+        background-color: #0a0c10;
+        color: #e0e0e0;
+    }
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: 700;
+        background: linear-gradient(135deg, #4caf50, #ff9800);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .ot-badge {
+        background: #1e2a1f;
+        color: #8bc34a;
+        padding: 0.3rem 1rem;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .risk-critical { color: #f44336; font-weight: bold; }
+    .risk-high { color: #ff9800; font-weight: bold; }
+    .risk-medium { color: #ffc107; }
+    .risk-low { color: #4caf50; }
+    .asset-card {
+        background: #1e1e2e;
+        padding: 1rem;
+        border-radius: 10px;
+        margin-bottom: 1rem;
+        border-left: 4px solid #ff9800;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # ---------- API Key Status ----------
 with st.sidebar:
+    st.markdown("### 🔧 Configuration")
     if NVD_API_KEY:
         st.success("✅ NVD API key loaded")
     else:
         st.info("ℹ️ No NVD API key – using public rate limits.")
     if not GROQ_API_KEY:
         st.error("❌ Groq API key required for AI Agent.")
+    st.markdown("---")
+    st.markdown("### 🏭 OT Community")
+    st.markdown("Share your analysis: [Export Report](#)")
 
 # ---------- Cached API Functions ----------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -61,10 +106,8 @@ def fetch_nvd_cve(cve_id: str) -> Optional[Dict]:
                     "exploitability_score": exploitability,
                     "description": desc,
                 }
-        else:
-            st.error(f"NVD API error {resp.status_code} for {cve_id}")
-    except Exception as e:
-        st.error(f"Error fetching {cve_id}: {e}")
+    except Exception:
+        pass
     return None
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -93,6 +136,18 @@ def fetch_kev_catalog() -> List[Dict]:
         pass
     return []
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_ics_advisories() -> List[Dict]:
+    """Fetch ICS-CERT advisories from CISA (JSON feed)."""
+    url = "https://www.cisa.gov/sites/default/files/feeds/ics-advisories.json"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("advisories", [])
+    except Exception:
+        pass
+    return []
+
 def is_in_kev(cve_id: str, kev_list: List[Dict]) -> bool:
     for item in kev_list:
         if item.get("cveID") == cve_id:
@@ -117,13 +172,15 @@ def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, max_results: int = 50) -> List[Dict]:
-    """
-    Search NVD with keyword and optional date range.
-    Returns list of CVE summaries (cve, description, published).
-    """
+    """Search NVD with optional keyword and date range. If keyword contains OT terms, boost relevance."""
     max_results = int(max_results)
     results = []
     start_index = 0
+    # Enhance keyword for OT context
+    ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
+    if any(term in keyword.lower() for term in ot_terms):
+        # Add "ics" to keyword to catch OT-specific CVEs
+        keyword += " ics"
 
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -132,8 +189,6 @@ def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Op
             "startIndex": start_index,
             "resultsPerPage": min(50, max_results - len(results)),
         }
-
-        # Add date filters if provided
         if start_date:
             params["pubStartDate"] = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
         if end_date:
@@ -158,13 +213,11 @@ def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Op
                 start_index += len(vulns)
                 if start_index >= total:
                     break
-                # Respect rate limits
                 time.sleep(0.2)
             elif resp.status_code == 404:
-                # No results for this keyword (with given date range)
                 break
             else:
-                st.error(f"NVD search error {resp.status_code} for '{keyword}'")
+                st.error(f"NVD search error {resp.status_code}")
                 break
         except Exception as e:
             st.error(f"Search error: {e}")
@@ -172,7 +225,6 @@ def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Op
     return results[:max_results]
 
 def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
-    """Fetch and enrich a single CVE with EPSS, KEV, and past likelihood."""
     nvd = fetch_nvd_cve(cve_id)
     if not nvd:
         return None
@@ -194,18 +246,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_vulnerabilities",
-            "description": "Search for vulnerabilities by keyword and return fully enriched data including CVSS score, EPSS probability, KEV status, and past likelihood. This is the primary tool for answering general questions about vulnerabilities.",
+            "description": "Search for vulnerabilities by keyword, with optional OT focus. Returns enriched data (CVSS, EPSS, KEV).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {
-                        "type": "string",
-                        "description": "The search term (e.g., 'Cisco', 'Apache', 'RCE')."
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of CVEs to return (default 10)."
-                    }
+                    "keyword": {"type": "string", "description": "Search term (e.g., 'Cisco', 'PLC', 'Modbus')."},
+                    "max_results": {"type": "integer", "description": "Max CVEs to return (default 10)."}
                 },
                 "required": ["keyword"]
             }
@@ -215,15 +261,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_cve_details",
-            "description": "Get full details of a specific CVE including CVSS score, description, EPSS probability, KEV status, and past likelihood.",
+            "description": "Get full details of a specific CVE.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "cve_id": {
-                        "type": "string",
-                        "description": "The CVE ID, e.g., 'CVE-2023-12345'."
-                    }
-                },
+                "properties": {"cve_id": {"type": "string", "description": "CVE ID"}},
                 "required": ["cve_id"]
             }
         }
@@ -232,17 +273,21 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_kev_catalog",
-            "description": "List vulnerabilities that are in the CISA Known Exploited Vulnerabilities (KEV) catalog. Returns up to 20 entries.",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "description": "List CVEs in CISA KEV catalog.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_ics_advisories",
+            "description": "Get recent ICS-CERT advisories (OT/ICS specific).",
+            "parameters": {"type": "object", "properties": {}}
         }
     }
 ]
 
 def execute_tool(tool_name: str, arguments: Dict) -> str:
-    """Execute the tool and return a string result."""
     if tool_name == "search_vulnerabilities":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
@@ -250,26 +295,17 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
             max_results = int(max_results)
         except:
             max_results = 10
-
-        # Search NVD without date filter (all time)
         basic_results = search_nvd(keyword, max_results=max_results)
         if not basic_results:
             return f"No vulnerabilities found for '{keyword}'."
-
-        # Fetch KEV catalog once
         kev_list = fetch_kev_catalog()
-
         enriched = []
         for item in basic_results[:max_results]:
-            cve_id = item["cve"]
-            enriched_item = enrich_cve(cve_id, kev_list)
+            enriched_item = enrich_cve(item["cve"], kev_list)
             if enriched_item:
                 enriched.append(enriched_item)
-
         if not enriched:
-            return f"Could not enrich any CVEs for '{keyword}'."
-
-        # Return as JSON
+            return f"Could not enrich CVEs for '{keyword}'."
         return json.dumps(enriched, indent=2)
 
     elif tool_name == "get_cve_details":
@@ -287,10 +323,16 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
         short_list = [{"cve": item.get("cveID"), "description": item.get("shortDescription", "")[:100]} for item in kev_list[:20]]
         return json.dumps(short_list, indent=2)
 
+    elif tool_name == "get_ics_advisories":
+        advisories = fetch_ics_advisories()
+        if not advisories:
+            return "No ICS advisories found."
+        short_list = [{"title": a.get("title"), "id": a.get("icsa"), "date": a.get("releaseDate")} for a in advisories[:10]]
+        return json.dumps(short_list, indent=2)
+
     else:
         return f"Unknown tool: {tool_name}"
 
-# ---------- LLM Agent Loop ----------
 def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[str, List[Dict]]:
     messages = []
     messages.extend(conversation_history)
@@ -298,15 +340,7 @@ def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[st
 
     system_prompt = {
         "role": "system",
-        "content": """You are a cybersecurity vulnerability analyst. You have access to the following tools:
-
-- search_vulnerabilities: Use this to search for vulnerabilities by keyword (e.g., "Cisco switches"). It returns a list of CVEs with CVSS scores, EPSS probabilities, KEV status, and past likelihood. This is your primary tool for answering general questions.
-
-- get_cve_details: Use this when you need detailed information about a specific CVE ID.
-
-- list_kev_catalog: Use this to list all CVEs in the CISA KEV catalog.
-
-When answering a question, use the appropriate tool(s) to gather data. If the user asks for a summary or analysis, first retrieve the data, then provide a concise, prioritized summary highlighting the most critical vulnerabilities (e.g., those with high CVSS, high EPSS, or in KEV). Be helpful and actionable."""
+        "content": """You are an OT/ICS cybersecurity analyst. You have access to NVD, EPSS, CISA KEV, and ICS-CERT advisories. Use tools to gather data. When answering, consider OT/ICS implications: safety, operational impact, and typical industrial network constraints. Provide actionable advice for asset owners."""
     }
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
@@ -355,10 +389,11 @@ When answering a question, use the appropriate tool(s) to gather data. If the us
 
 # ---------- Streamlit UI ----------
 def main():
-    st.title("🛡️ Vulnerability Intelligence Dashboard")
-    st.markdown("Aggregate **CVSS**, **EPSS**, **CISA KEV**, and compute **Past Likelihood (LEV)**. Powered by open‑source LLM (Groq).")
+    st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
+    st.markdown("Powered by **NVD**, **EPSS**, **CISA KEV**, **ICS‑CERT** — with AI insights from Groq (Llama 3.3 70B)")
 
-    mode = st.sidebar.radio("Select Mode", ["Single CVE Lookup", "Search & Dashboard", "AI Agent"])
+    # Sidebar for mode selection
+    mode = st.sidebar.radio("Select Mode", ["Single CVE Lookup", "Search & Dashboard", "OT Asset Risk Analyzer", "AI Agent"])
 
     if mode == "Single CVE Lookup":
         st.header("🔍 Single CVE Lookup")
@@ -392,7 +427,7 @@ def main():
         st.header("🔎 Search & Dashboard")
         col1, col2, col3 = st.columns(3)
         with col1:
-            keyword = st.text_input("Search Keyword (e.g., 'Apache', 'RCE')")
+            keyword = st.text_input("Search Keyword (e.g., 'PLC', 'Modbus', 'Cisco')")
         with col2:
             start_date = st.date_input("Published From", datetime.now() - timedelta(days=30))
         with col3:
@@ -441,9 +476,44 @@ def main():
                             col2.metric("Max CVSS Score", f"{df_plot['cvss_score'].max():.2f}")
                             col3.metric("KEV Count", len(df[df["kev"] == True]))
 
-    elif mode == "AI Agent":
-        st.header("🤖 AI Vulnerability Agent")
-        st.markdown("Ask anything about vulnerabilities. The agent will fetch data from NVD, EPSS, and CISA KEV as needed.")
+    elif mode == "OT Asset Risk Analyzer":
+        st.header("🏭 OT Asset Risk Analyzer")
+        st.markdown("Enter your OT assets (one per line) to discover vulnerabilities affecting them.")
+        assets_text = st.text_area("Assets (e.g., 'Siemens S7-1200', 'Modicon M241', 'Rockwell ControlLogix')", height=150)
+        if st.button("Analyze OT Assets", type="primary"):
+            if not assets_text.strip():
+                st.warning("Please enter at least one asset.")
+            else:
+                assets = [a.strip() for a in assets_text.split('\n') if a.strip()]
+                all_results = []
+                for asset in assets:
+                    with st.spinner(f"Searching for {asset}..."):
+                        cve_list = search_nvd(asset, max_results=10)
+                        kev_list = fetch_kev_catalog()
+                        for item in cve_list:
+                            enriched = enrich_cve(item["cve"], kev_list)
+                            if enriched:
+                                enriched["asset"] = asset
+                                all_results.append(enriched)
+                if not all_results:
+                    st.info("No vulnerabilities found for the provided assets.")
+                else:
+                    df = pd.DataFrame(all_results)
+                    st.subheader("🔍 Vulnerabilities by Asset")
+                    # Add OT‑specific risk score
+                    df["OT_Risk"] = df.apply(lambda row: "Critical" if row["kev"] else ("High" if row["cvss_score"] > 7.0 else "Medium"), axis=1)
+                    st.dataframe(df, use_container_width=True)
+                    # Generate LLM summary
+                    if GROQ_API_KEY:
+                        prompt = f"Analyze these OT vulnerabilities for assets {assets}. Summarize the highest risks and provide mitigation steps:\n{df.to_string()}"
+                        with st.spinner("Generating OT risk summary..."):
+                            summary = agent_query(prompt, [])[0]
+                            st.markdown("### 🤖 OT Risk Summary")
+                            st.write(summary)
+
+    else:  # AI Agent
+        st.header("🤖 OT Vulnerability Agent")
+        st.markdown("Ask anything about OT/ICS vulnerabilities. The agent can search NVD, fetch ICS advisories, and analyze risk.")
 
         if "agent_messages" not in st.session_state:
             st.session_state.agent_messages = []
