@@ -5,7 +5,6 @@ import requests
 from datetime import datetime, timedelta
 import time
 import json
-import groq
 from typing import Dict, List, Optional, Tuple
 
 # ---------- Page Configuration ----------
@@ -23,9 +22,9 @@ except:
     NVD_API_KEY = None
 
 try:
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+    HF_API_KEY = st.secrets["HF_API_KEY"]
 except:
-    GROQ_API_KEY = None
+    HF_API_KEY = None
 
 # ---------- Helper Functions ----------
 def safe_float(x):
@@ -93,12 +92,13 @@ def fetch_ics_advisories() -> List[Dict]:
         pass
     return []
 
-def search_nvd(keyword: str, max_results: int = 20, lookback_months: int = 24) -> List[Dict]:
-    """Search NVD for CVEs matching keyword."""
+def search_nvd(keyword: str, max_results: int = 20, lookback_months: int = 24) -> Tuple[List[Dict], int]:
+    """Search NVD for CVEs matching keyword. Returns (list, total_count)."""
     start_date = datetime.now() - timedelta(days=lookback_months * 30)
     end_date = datetime.now()
     results = []
     start_index = 0
+    total_count = 0
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         params = {
@@ -113,6 +113,7 @@ def search_nvd(keyword: str, max_results: int = 20, lookback_months: int = 24) -
             resp = requests.get(url, params=params, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
+                total_count = data.get("totalResults", 0)
                 vulns = data.get("vulnerabilities", [])
                 if not vulns:
                     break
@@ -124,7 +125,7 @@ def search_nvd(keyword: str, max_results: int = 20, lookback_months: int = 24) -
                         "published": cve["published"],
                     })
                 start_index += len(vulns)
-                if start_index >= data.get("totalResults", 0):
+                if start_index >= total_count:
                     break
                 time.sleep(0.2)
             elif resp.status_code == 404:
@@ -135,7 +136,7 @@ def search_nvd(keyword: str, max_results: int = 20, lookback_months: int = 24) -
         except Exception as e:
             st.error(f"Search error: {e}")
             break
-    return results[:max_results]
+    return results[:max_results], total_count
 
 def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
     nvd = fetch_nvd_cve(cve_id)
@@ -156,11 +157,11 @@ def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
     }
 
 def analyze_assets(df, column_map, lookback_months=24):
-    """Analyze each asset using the column mapping."""
+    """Analyze each asset, return (vuln_df, debug_info)."""
     kev_list = fetch_kev_catalog()
     all_vulns = []
+    debug_info = []  # (asset_name, query, results_count)
     for _, row in df.iterrows():
-        # Build query from mapped columns
         terms = []
         for field in ["asset_name", "asset_type", "vendor", "model", "firmware"]:
             col = column_map.get(field)
@@ -169,7 +170,8 @@ def analyze_assets(df, column_map, lookback_months=24):
         if not terms:
             continue
         query = " ".join(terms)
-        cve_list = search_nvd(query, max_results=10, lookback_months=lookback_months)
+        cve_list, total_count = search_nvd(query, max_results=10, lookback_months=lookback_months)
+        debug_info.append((row.get(column_map.get("asset_name", ""), "Unknown"), query, total_count))
         for cve_info in cve_list:
             enriched = enrich_cve(cve_info["cve"], kev_list)
             if enriched:
@@ -179,10 +181,10 @@ def analyze_assets(df, column_map, lookback_months=24):
                 enriched["model"] = row.get(column_map.get("model", ""), "")
                 all_vulns.append(enriched)
     df_vulns = pd.DataFrame(all_vulns)
-    return df_vulns
+    return df_vulns, debug_info
 
 def generate_threat_summary(df_vulns, assets_count):
-    """Generate AI summary of the threat landscape."""
+    """Generate AI summary using Hugging Face Inference API."""
     if df_vulns.empty:
         return "No vulnerabilities found for the uploaded assets."
     top_cves = df_vulns.nlargest(10, "cvss_score")[["cve", "cvss_score", "kev", "description"]]
@@ -194,8 +196,7 @@ def generate_threat_summary(df_vulns, assets_count):
         "assets_affected": df_vulns["asset"].nunique(),
         "top_assets": df_vulns.groupby("asset").size().sort_values(ascending=False).head(5).to_dict(),
     }
-    prompt = f"""
-You are a cybersecurity analyst. Based on the following vulnerability data from NVD, EPSS, and CISA KEV, provide a concise summary of the threat landscape for the uploaded OT assets.
+    prompt = f"""You are a cybersecurity analyst. Based on the following vulnerability data from NVD, EPSS, and CISA KEV, provide a concise summary of the threat landscape for the uploaded OT assets.
 
 Assets analyzed: {assets_count}
 
@@ -210,187 +211,88 @@ Vulnerability statistics:
 Top 10 CVEs by CVSS score:
 {top_cves.to_string()}
 
-Also consider any relevant ICS‑CERT advisories that might affect these assets (not included here, but the agent can fetch them). 
-Write a brief summary highlighting the most critical risks and recommended immediate actions.
-"""
-    if not GROQ_API_KEY:
-        return "Groq API key not configured. Cannot generate summary."
-    client = groq.Groq(api_key=GROQ_API_KEY)
+Also consider any relevant ICS‑CERT advisories that might affect these assets (not included here). 
+Write a brief summary highlighting the most critical risks and recommended immediate actions."""
+    
+    if not HF_API_KEY:
+        return "Hugging Face API key not configured. Cannot generate summary."
+
+    url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    payload = {
+        "inputs": f"<s>[INST] {prompt} [/INST]",
+        "parameters": {
+            "max_new_tokens": 800,
+            "temperature": 0.3,
+            "return_full_text": False
+        }
+    }
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=800,
-        )
-        return response.choices[0].message.content
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) > 0:
+            return data[0].get("generated_text", "No response").strip()
+        else:
+            return "Error: Unexpected response format."
     except Exception as e:
         return f"Error generating summary: {e}"
 
-# ---------- AI Agent Tools ----------
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_vulnerabilities",
-            "description": "Search for vulnerabilities by keyword in NVD.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {"type": "string", "description": "Search term (e.g., 'Siemens S7-1200')"},
-                    "max_results": {"type": "integer", "description": "Max CVEs to return (default 10)"}
-                },
-                "required": ["keyword"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_cve_details",
-            "description": "Get full details of a specific CVE including CVSS, EPSS, KEV status.",
-            "parameters": {
-                "type": "object",
-                "properties": {"cve_id": {"type": "string", "description": "CVE ID"}},
-                "required": ["cve_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_kev_catalog",
-            "description": "List CVEs in CISA KEV catalog.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_ics_advisories",
-            "description": "Get recent ICS-CERT advisories.",
-            "parameters": {"type": "object", "properties": {}}
+def hf_chat(prompt: str, context: str) -> str:
+    """Chat using Hugging Face Inference API."""
+    if not HF_API_KEY:
+        return "Hugging Face API key not configured."
+    url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+    system_msg = f"You are a cybersecurity analyst specialized in OT/ICS vulnerabilities. Use the following asset context to answer questions.\n\nAsset Context:\n{context}\n\n"
+    full_prompt = f"<s>[INST] {system_msg}{prompt} [/INST]"
+    payload = {
+        "inputs": full_prompt,
+        "parameters": {
+            "max_new_tokens": 512,
+            "temperature": 0.3,
+            "return_full_text": False
         }
     }
-]
-
-def execute_tool(tool_name: str, arguments: Dict) -> str:
-    """Execute tool and return result as string."""
-    if tool_name == "search_vulnerabilities":
-        keyword = arguments["keyword"]
-        max_results = arguments.get("max_results", 10)
-        try:
-            max_results = int(max_results)
-        except:
-            max_results = 10
-        results = search_nvd(keyword, max_results=max_results, lookback_months=24)
-        if not results:
-            return f"No vulnerabilities found for '{keyword}'."
-        kev_list = fetch_kev_catalog()
-        enriched = []
-        for item in results[:max_results]:
-            enriched_item = enrich_cve(item["cve"], kev_list)
-            if enriched_item:
-                enriched.append(enriched_item)
-        if not enriched:
-            return f"Could not enrich CVEs for '{keyword}'."
-        return json.dumps(enriched, indent=2)
-
-    elif tool_name == "get_cve_details":
-        cve_id = arguments["cve_id"]
-        kev_list = fetch_kev_catalog()
-        enriched = enrich_cve(cve_id, kev_list)
-        if not enriched:
-            return f"CVE {cve_id} not found."
-        return json.dumps(enriched, indent=2)
-
-    elif tool_name == "list_kev_catalog":
-        kev_list = fetch_kev_catalog()
-        if not kev_list:
-            return "No KEV entries found."
-        short_list = [{"cve": item.get("cveID"), "description": item.get("shortDescription", "")[:100]} for item in kev_list[:20]]
-        return json.dumps(short_list, indent=2)
-
-    elif tool_name == "get_ics_advisories":
-        advisories = fetch_ics_advisories()
-        if not advisories:
-            return "No ICS advisories found."
-        short_list = [{"title": a.get("title"), "id": a.get("icsa"), "date": a.get("releaseDate")} for a in advisories[:10]]
-        return json.dumps(short_list, indent=2)
-
-    else:
-        return f"Unknown tool: {tool_name}"
-
-def agent_query(user_message: str, conversation_history: List[Dict], context: str = "") -> Tuple[str, List[Dict]]:
-    """Process user message with tool calling."""
-    if not GROQ_API_KEY:
-        return "Groq API key not configured. AI Agent disabled.", conversation_history
-
-    messages = []
-    messages.extend(conversation_history)
-    messages.append({"role": "user", "content": user_message})
-
-    system_prompt = {
-        "role": "system",
-        "content": f"""You are a cybersecurity analyst specialized in OT/ICS vulnerabilities.
-You have access to tools to search NVD, get CVE details, list KEV, and get ICS-CERT advisories.
-Use these tools to answer questions about the uploaded assets and their vulnerabilities.
-Context about the assets (from the Excel file) may be provided below.
-
-Asset Context:
-{context}
-
-Be concise but thorough. When asked about a specific asset, search for its vulnerabilities using the appropriate tools."""
-    }
-    if not messages or messages[0].get("role") != "system":
-        messages.insert(0, system_prompt)
-
-    max_iterations = 5
-    iteration = 0
-
-    while iteration < max_iterations:
-        client = groq.Groq(api_key=GROQ_API_KEY)
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.2,
-                max_tokens=1024,
-            )
-            assistant_message = response.choices[0].message
-        except Exception as e:
-            return f"Error calling LLM: {e}", conversation_history
-
-        if assistant_message.tool_calls:
-            messages.append(assistant_message)
-            for tool_call in assistant_message.tool_calls:
-                tool_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
-                tool_result = execute_tool(tool_name, arguments)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result,
-                })
-            iteration += 1
-            continue
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and len(data) > 0:
+            return data[0].get("generated_text", "No response").strip()
         else:
-            final_answer = assistant_message.content
-            conversation_history.append({"role": "user", "content": user_message})
-            conversation_history.append({"role": "assistant", "content": final_answer})
-            return final_answer, conversation_history
-
-    final_message = "I'm sorry, I couldn't resolve your request. Please try again."
-    conversation_history.append({"role": "user", "content": user_message})
-    conversation_history.append({"role": "assistant", "content": final_message})
-    return final_message, conversation_history
+            return "Error: Unexpected response format."
+    except Exception as e:
+        return f"Error: {e}"
 
 # ---------- Streamlit UI ----------
 def main():
     st.title("🛡️ OT Threat Intelligence")
     st.markdown("Upload an Excel/CSV file with your OT assets, then map columns to asset fields. The AI will analyze vulnerabilities and provide a summary.")
+
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        lookback_months = st.slider(
+            "Lookback months (how far back to search for CVEs)",
+            min_value=1, max_value=120, value=24, step=1,
+            help="Increase if you want to see older CVEs."
+        )
+        st.session_state.lookback_months = lookback_months
+
+        st.markdown("---")
+        st.subheader("🔎 Manual Test Search")
+        test_keyword = st.text_input("Enter a keyword (e.g., 'Siemens S7-1200')")
+        if st.button("Test NVD Search"):
+            if test_keyword:
+                with st.spinner("Searching NVD..."):
+                    results, total = search_nvd(test_keyword, max_results=5, lookback_months=lookback_months)
+                    if results:
+                        st.success(f"Found {total} total CVEs. First 5:")
+                        for r in results:
+                            st.write(f"- {r['cve']}: {r['description'][:100]}...")
+                    else:
+                        st.warning("No results. Try different keywords or increase lookback.")
 
     # File upload
     uploaded_file = st.file_uploader("Choose file", type=["xlsx", "csv"])
@@ -421,23 +323,32 @@ def main():
                 submit = st.form_submit_button("Analyze Assets")
 
             if submit:
-                # Remove "None" selections
                 col_map = {k: v for k, v in col_map.items() if v != "-- None --"}
                 if "asset_name" not in col_map:
                     st.error("Asset Name is required for analysis.")
                     return
 
-                # Analyze
                 with st.spinner("Analyzing assets for vulnerabilities (this may take a few minutes)..."):
-                    df_vulns = analyze_assets(df, col_map, lookback_months=24)
+                    df_vulns, debug_info = analyze_assets(df, col_map, lookback_months=lookback_months)
                     st.session_state.vuln_df = df_vulns
                     st.session_state.asset_df = df
                     st.session_state.asset_count = len(df)
+                    st.session_state.debug_info = debug_info
+                    # Create a context string for the chatbot
+                    asset_str = df[list(col_map.values())].head(20).to_string()
+                    st.session_state.asset_context = f"Assets ({len(df)} rows):\n{asset_str}\n\nVulnerabilities found: {len(df_vulns)}"
+                    if not df_vulns.empty:
+                        st.session_state.asset_context += f"\nTop CVEs:\n{df_vulns[['cve','cvss_score','kev','description']].head(10).to_string()}"
+
+                # Debug expander
+                with st.expander("🔍 Search Query Debug"):
+                    for name, query, count in debug_info:
+                        st.write(f"**{name}**: `{query}` → {count} results")
+                    st.caption("If a query returns zero results, try simplifying the query or increasing lookback.")
 
                 if df_vulns.empty:
-                    st.warning("No vulnerabilities found. Try adjusting the lookback period or check your asset data.")
+                    st.warning("No vulnerabilities found. Check the debug info.")
                 else:
-                    # Generate summary
                     with st.spinner("Generating threat summary..."):
                         summary = generate_threat_summary(df_vulns, len(df))
                         st.subheader("📊 Threat Landscape Summary")
@@ -445,22 +356,18 @@ def main():
 
                     # Dashboards
                     st.subheader("📈 Vulnerability Dashboard")
-                    # CVSS Distribution
                     fig1 = px.histogram(df_vulns, x="cvss_score", nbins=20, title="CVSS Score Distribution")
                     st.plotly_chart(fig1, use_container_width=True)
 
-                    # Risk level pie chart
                     df_vulns["risk_level"] = pd.cut(df_vulns["cvss_score"], bins=[0, 4, 7, 9, 10], labels=["Low", "Medium", "High", "Critical"])
                     risk_counts = df_vulns["risk_level"].value_counts().reset_index()
                     fig2 = px.pie(risk_counts, values="count", names="risk_level", title="Risk Level Distribution")
                     st.plotly_chart(fig2, use_container_width=True)
 
-                    # Top affected assets
                     top_assets = df_vulns["asset"].value_counts().head(10).reset_index()
                     fig3 = px.bar(top_assets, x="asset", y="count", title="Top 10 Affected Assets")
                     st.plotly_chart(fig3, use_container_width=True)
 
-                    # Table of top CVEs
                     st.subheader("Top 10 Critical CVEs")
                     top_cves = df_vulns.nlargest(10, "cvss_score")[["cve", "cvss_score", "epss", "kev", "description", "asset"]]
                     st.dataframe(top_cves)
@@ -471,21 +378,14 @@ def main():
     # Chatbot section
     st.markdown("---")
     st.subheader("💬 Ask the AI Analyst")
-    st.markdown("Ask questions about the assets, vulnerabilities, or any related threats. The agent can search NVD, get CVE details, list KEV, and fetch ICS advisories.")
+    st.markdown("Ask questions about the assets, vulnerabilities, or any related threats.")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-
-    # Provide context from assets (if any) to the agent
-    context_str = ""
-    if "asset_df" in st.session_state:
-        # Show a summary of assets, not full dataframe
-        context_str = f"Uploaded assets ({st.session_state.asset_count} rows):\n" + st.session_state.asset_df.head(20).to_string()
 
     if prompt := st.chat_input("Ask a question..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -494,10 +394,10 @@ def main():
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                answer, new_history = agent_query(prompt, st.session_state.messages, context_str)
+                context = st.session_state.get("asset_context", "No assets uploaded yet.")
+                answer = hf_chat(prompt, context)
                 st.markdown(answer)
-                # Update conversation history
-                st.session_state.messages = new_history
+                st.session_state.messages.append({"role": "assistant", "content": answer})
 
 if __name__ == "__main__":
     main()
