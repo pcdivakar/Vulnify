@@ -248,13 +248,24 @@ def delete_asset_type(email, type_name):
     conn.close()
 
 # ---------- Asset Management ----------
+def asset_exists(email, asset_name):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT id FROM assets WHERE email=? AND asset_name=?", (email, asset_name))
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
+
 def add_asset(email, asset_name, asset_type, location):
+    if asset_exists(email, asset_name):
+        return False
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("INSERT INTO assets (email, asset_name, asset_type, location, created_at) VALUES (?, ?, ?, ?, ?)",
               (email, asset_name, asset_type, location, datetime.now()))
     conn.commit()
     conn.close()
+    return True
 
 def get_user_assets(email):
     conn = sqlite3.connect('ot_platform.db')
@@ -799,20 +810,15 @@ def plot_network_graph(email, type_colors, seed=None):
     # Use a larger k to spread nodes more
     pos = nx.spring_layout(G, k=3, iterations=80, seed=seed)
 
-    # Prepare edge traces with hover text for relationship type
+    # Prepare edge traces
     edge_x = []
     edge_y = []
-    edge_text = []
     for edge in G.edges():
         x0, y0 = pos[edge[0]]
         x1, y1 = pos[edge[1]]
         edge_x.extend([x0, x1, None])
         edge_y.extend([y0, y1, None])
-        rel = G.edges[edge].get("relationship", "connected")
-        edge_text.append(rel)
 
-    # We'll add edge text as annotations (simpler to add hover)
-    # For now, just use a separate trace for edge labels (optional)
     edge_trace = go.Scatter(
         x=edge_x, y=edge_y,
         line=dict(width=1.5, color='#888'),
@@ -833,7 +839,6 @@ def plot_network_graph(email, type_colors, seed=None):
         asset_type = node_data['type']
         color = type_colors.get(asset_type, "#aaaaaa")
         node_colors.append(color)
-        # Use larger size for nodes with many connections? Not needed now.
         node_sizes.append(40)
         node_text.append(
             f"<b>{node_data['name']}</b><br>Type: {asset_type}<br>Location: {node_data['location']}"
@@ -909,7 +914,6 @@ def main():
         col_actions = st.columns([1,1,1])
         with col_actions[0]:
             if st.button("🔄 Refresh Data", help="Re‑fetch vulnerabilities for all assets"):
-                # Clear cache for search_nvd (or just rerun)
                 st.cache_data.clear()
                 st.rerun()
         with col_actions[1]:
@@ -1070,13 +1074,16 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                 location = st.text_input("Location (optional)")
             if st.button("Add Asset"):
                 if asset_name:
-                    add_asset(user_email, asset_name, asset_type, location)
-                    st.success(f"Added {asset_name}")
-                    st.rerun()
+                    added = add_asset(user_email, asset_name, asset_type, location)
+                    if added:
+                        st.success(f"Added {asset_name}")
+                        st.rerun()
+                    else:
+                        st.warning(f"Asset '{asset_name}' already exists.")
                 else:
                     st.warning("Please enter an asset name.")
 
-        # Import from Excel/CSV
+        # Import from Excel/CSV (deduplicated)
         with st.expander("📎 Import from Excel/CSV"):
             uploaded_file = st.file_uploader("Choose file", type=["xlsx", "csv"])
             if uploaded_file:
@@ -1086,15 +1093,22 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                     else:
                         df = pd.read_excel(uploaded_file)
                     type_list = get_asset_types(user_email)
+                    added_count = 0
+                    duplicate_count = 0
                     for idx, row in df.iterrows():
                         name = str(row.iloc[0]).strip()
                         if name and name != "nan":
+                            # Check if asset already exists for this user
+                            if asset_exists(user_email, name):
+                                duplicate_count += 1
+                                continue
                             asset_type = str(row.iloc[1]) if len(row) > 1 else "Other"
                             if asset_type not in type_list:
                                 add_asset_type(user_email, asset_type)
                             location = str(row.iloc[2]) if len(row) > 2 else ""
                             add_asset(user_email, name, asset_type, location)
-                    st.success(f"Imported {len(df)} assets.")
+                            added_count += 1
+                    st.success(f"Imported {added_count} new assets. {duplicate_count} duplicates skipped.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error reading file: {e}")
@@ -1129,18 +1143,18 @@ Assets and their top vulnerabilities (EPSS > 0.5):
             type_colors = {t: color_palette[i % len(color_palette)] for i, t in enumerate(asset_types)}
             type_colors["Other"] = "#aaaaaa"
 
-            # Graph visualization (scrollable)
+            # Graph visualization
             st.subheader("Network Graph")
-            # Layout seed for reset
             if "graph_seed" not in st.session_state:
                 st.session_state.graph_seed = 42
 
             fig = plot_network_graph(user_email, type_colors, seed=st.session_state.graph_seed)
             if fig:
-                # Add reset layout button
-                if st.button("🔄 Reset Graph Layout"):
-                    st.session_state.graph_seed = random.randint(1, 10000)
-                    st.rerun()
+                col_buttons = st.columns([1,4])
+                with col_buttons[0]:
+                    if st.button("🔄 Reset Layout"):
+                        st.session_state.graph_seed = random.randint(1, 10000)
+                        st.rerun()
                 st.markdown(
                     '<div class="graph-container">',
                     unsafe_allow_html=True
