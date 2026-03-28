@@ -116,22 +116,29 @@ def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
     return "Unknown"
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_results: int = 50) -> List[Dict]:
-    """Basic NVD keyword search (returns only CVE ID and description)."""
+def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, max_results: int = 50) -> List[Dict]:
+    """
+    Search NVD with keyword and optional date range.
+    Returns list of CVE summaries (cve, description, published).
+    """
     max_results = int(max_results)
     results = []
     start_index = 0
+
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-        pub_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
-        pub_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
         params = {
             "keywordSearch": keyword,
-            "pubStartDate": pub_start,
-            "pubEndDate": pub_end,
             "startIndex": start_index,
             "resultsPerPage": min(50, max_results - len(results)),
         }
+
+        # Add date filters if provided
+        if start_date:
+            params["pubStartDate"] = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
+        if end_date:
+            params["pubEndDate"] = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
+
         headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=10)
@@ -151,12 +158,13 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
                 start_index += len(vulns)
                 if start_index >= total:
                     break
-                time.sleep(0.2)  # avoid rate limits
+                # Respect rate limits
+                time.sleep(0.2)
             elif resp.status_code == 404:
-                st.warning(f"NVD search returned 404 – no results for '{keyword}'.")
+                # No results for this keyword (with given date range)
                 break
             else:
-                st.error(f"NVD search error {resp.status_code}")
+                st.error(f"NVD search error {resp.status_code} for '{keyword}'")
                 break
         except Exception as e:
             st.error(f"Search error: {e}")
@@ -243,8 +251,8 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
         except:
             max_results = 10
 
-        # First, get basic list from NVD (last year)
-        basic_results = search_nvd(keyword, datetime.now() - timedelta(days=365), datetime.now(), max_results)
+        # Search NVD without date filter (all time)
+        basic_results = search_nvd(keyword, max_results=max_results)
         if not basic_results:
             return f"No vulnerabilities found for '{keyword}'."
 
@@ -303,7 +311,7 @@ When answering a question, use the appropriate tool(s) to gather data. If the us
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
 
-    max_iterations = 10  # allow deeper reasoning if needed
+    max_iterations = 10
     iteration = 0
 
     while iteration < max_iterations:
