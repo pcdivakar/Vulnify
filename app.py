@@ -163,7 +163,8 @@ def analyze_assets(df, column_map, lookback_months=24):
     debug_info = []  # (asset_name, query, results_count)
     for _, row in df.iterrows():
         terms = []
-        for field in ["asset_name", "asset_type", "vendor", "model", "firmware"]:
+        # Only use asset_name, asset_type, vendor, model (firmware removed)
+        for field in ["asset_name", "asset_type", "vendor", "model"]:
             col = column_map.get(field)
             if col and pd.notna(row[col]) and str(row[col]).strip():
                 terms.append(str(row[col]).strip())
@@ -265,6 +266,22 @@ def hf_chat(prompt: str, context: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+def search_ics_advisories(keyword: str, max_results: int = 10) -> List[Dict]:
+    """Search ICS-CERT advisories for a keyword (very simple)."""
+    advisories = fetch_ics_advisories()
+    if not advisories:
+        return []
+    results = []
+    keyword_lower = keyword.lower()
+    for adv in advisories:
+        title = adv.get("title", "").lower()
+        description = adv.get("shortDescription", "").lower()
+        if keyword_lower in title or keyword_lower in description:
+            results.append(adv)
+            if len(results) >= max_results:
+                break
+    return results
+
 # ---------- Streamlit UI ----------
 def main():
     st.title("🛡️ OT Threat Intelligence")
@@ -319,7 +336,8 @@ def main():
                     col_map["asset_type"] = st.selectbox("Asset Type (optional)", ["-- None --"] + cols, index=0)
                     col_map["model"] = st.selectbox("Model (optional)", ["-- None --"] + cols, index=0)
                 with col3:
-                    col_map["firmware"] = st.selectbox("Firmware (optional)", ["-- None --"] + cols, index=0)
+                    # Firmware mapping kept but will not be used in query
+                    col_map["firmware"] = st.selectbox("Firmware (optional, not used in search)", ["-- None --"] + cols, index=0)
                 submit = st.form_submit_button("Analyze Assets")
 
             if submit:
@@ -371,6 +389,22 @@ def main():
                     st.subheader("Top 10 Critical CVEs")
                     top_cves = df_vulns.nlargest(10, "cvss_score")[["cve", "cvss_score", "epss", "kev", "description", "asset"]]
                     st.dataframe(top_cves)
+
+            # Optionally show ICS-CERT advisories related to the assets
+            if "asset_name" in col_map:
+                with st.expander("📢 ICS-CERT Advisories (first 10 per asset)"):
+                    # Get first asset name from the mapping
+                    sample_asset = df[col_map["asset_name"]].iloc[0] if not df.empty else None
+                    if sample_asset:
+                        advisories = search_ics_advisories(str(sample_asset), max_results=10)
+                        if advisories:
+                            st.write(f"Advisories related to '{sample_asset}':")
+                            for adv in advisories:
+                                st.markdown(f"**{adv.get('icsa')}**: {adv.get('title')} – [Link]({adv.get('url', '#')})")
+                        else:
+                            st.info(f"No ICS-CERT advisories found for '{sample_asset}'. Try a manual search later.")
+                    else:
+                        st.info("No asset name mapped to search ICS advisories.")
 
         except Exception as e:
             st.error(f"Error processing file: {e}")
