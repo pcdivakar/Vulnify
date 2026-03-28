@@ -4,3 +4,4 @@ pandas
 plotly
 groq
 python-dotenv
+uuid
