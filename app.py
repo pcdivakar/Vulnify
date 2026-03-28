@@ -144,6 +144,11 @@ def init_db():
                   asset_type TEXT,
                   location TEXT,
                   created_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS asset_metadata
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  asset_id INTEGER,
+                  metadata TEXT,
+                  FOREIGN KEY(asset_id) REFERENCES assets(id))''')
     c.execute('''CREATE TABLE IF NOT EXISTS alerts
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   email TEXT,
@@ -203,7 +208,6 @@ def safe_float(x):
     except (ValueError, TypeError):
         return 0.0
 
-# ---------- Ensure User in Database ----------
 def ensure_user(email):
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
@@ -256,16 +260,20 @@ def asset_exists(email, asset_name):
     conn.close()
     return exists
 
-def add_asset(email, asset_name, asset_type, location):
+def add_asset(email, asset_name, asset_type, location, metadata=None):
     if asset_exists(email, asset_name):
-        return False
+        return False, None
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("INSERT INTO assets (email, asset_name, asset_type, location, created_at) VALUES (?, ?, ?, ?, ?)",
               (email, asset_name, asset_type, location, datetime.now()))
+    asset_id = c.lastrowid
+    if metadata:
+        c.execute("INSERT INTO asset_metadata (asset_id, metadata) VALUES (?, ?)",
+                  (asset_id, json.dumps(metadata)))
     conn.commit()
     conn.close()
-    return True
+    return True, asset_id
 
 def get_user_assets(email):
     conn = sqlite3.connect('ot_platform.db')
@@ -280,6 +288,7 @@ def delete_asset(asset_id):
     c = conn.cursor()
     c.execute("DELETE FROM assets WHERE id=?", (asset_id,))
     c.execute("DELETE FROM connections WHERE source_asset_id=? OR target_asset_id=?", (asset_id, asset_id))
+    c.execute("DELETE FROM asset_metadata WHERE asset_id=?", (asset_id,))
     conn.commit()
     conn.close()
 
@@ -288,6 +297,7 @@ def delete_all_assets(email):
     c = conn.cursor()
     c.execute("DELETE FROM assets WHERE email=?", (email,))
     c.execute("DELETE FROM connections WHERE email=?", (email,))
+    c.execute("DELETE FROM asset_metadata WHERE asset_id IN (SELECT id FROM assets WHERE email=?)", (email,))
     conn.commit()
     conn.close()
 
@@ -298,6 +308,14 @@ def get_asset_by_id(asset_id):
     row = c.fetchone()
     conn.close()
     return row
+
+def get_asset_id_by_name(email, asset_name):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT id FROM assets WHERE email=? AND asset_name=?", (email, asset_name))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 # ---------- Connection Management ----------
 def add_connection(email, source_id, target_id, rel_type):
@@ -810,7 +828,6 @@ def plot_network_graph(email, type_colors, seed=None):
     # Use a larger k to spread nodes more
     pos = nx.spring_layout(G, k=3, iterations=80, seed=seed)
 
-    # Prepare edge traces
     edge_x = []
     edge_y = []
     for edge in G.edges():
@@ -1074,7 +1091,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                 location = st.text_input("Location (optional)")
             if st.button("Add Asset"):
                 if asset_name:
-                    added = add_asset(user_email, asset_name, asset_type, location)
+                    added, _ = add_asset(user_email, asset_name, asset_type, location)
                     if added:
                         st.success(f"Added {asset_name}")
                         st.rerun()
@@ -1083,33 +1100,128 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                 else:
                     st.warning("Please enter an asset name.")
 
-        # Import from Excel/CSV (deduplicated)
+        # Import from Excel/CSV with column mapping (including connections)
         with st.expander("📎 Import from Excel/CSV"):
             uploaded_file = st.file_uploader("Choose file", type=["xlsx", "csv"])
             if uploaded_file:
                 try:
+                    # Read file
                     if uploaded_file.name.endswith('.csv'):
                         df = pd.read_csv(uploaded_file)
                     else:
                         df = pd.read_excel(uploaded_file)
-                    type_list = get_asset_types(user_email)
-                    added_count = 0
-                    duplicate_count = 0
-                    for idx, row in df.iterrows():
-                        name = str(row.iloc[0]).strip()
-                        if name and name != "nan":
-                            # Check if asset already exists for this user
-                            if asset_exists(user_email, name):
+
+                    st.subheader("Preview (first 5 rows)")
+                    st.dataframe(df.head(5))
+
+                    # Let user select columns
+                    cols = df.columns.tolist()
+                    st.markdown("**Map columns to asset fields**")
+                    col1, col2, col3, col4, col5, col6 = st.columns(6)
+                    with col1:
+                        name_col = st.selectbox("Asset Name column", cols, index=0)
+                    with col2:
+                        type_col = st.selectbox("Asset Type column (optional)", ["-- Skip --"] + cols, index=0)
+                    with col3:
+                        loc_col = st.selectbox("Location column (optional)", ["-- Skip --"] + cols, index=0)
+                    with col4:
+                        conn_col = st.selectbox("Connections column (comma‑separated asset names)", ["-- Skip --"] + cols, index=0)
+                    with col5:
+                        subnet_col = st.selectbox("Subnet column (optional)", ["-- Skip --"] + cols, index=0)
+                    with col6:
+                        vlan_col = st.selectbox("VLAN column (optional)", ["-- Skip --"] + cols, index=0)
+
+                    # Option to clear existing connections before import
+                    clear_connections = st.checkbox("Clear existing connections before import (avoids duplicates)", value=True)
+
+                    if st.button("Import Assets"):
+                        # Optionally clear all existing connections
+                        if clear_connections:
+                            delete_all_connections(user_email)
+
+                        # Get existing asset names to avoid duplicates
+                        existing_assets = {a[1]: a[0] for a in get_user_assets(user_email)}
+                        added_count = 0
+                        duplicate_count = 0
+                        type_list = get_asset_types(user_email)
+
+                        # We'll store a mapping from asset name to its ID for connections
+                        # Since we might add new assets, we'll build the mapping after each addition
+                        asset_name_to_id = existing_assets.copy()
+
+                        # First pass: add assets (no connections yet)
+                        for _, row in df.iterrows():
+                            asset_name = str(row[name_col]).strip()
+                            if not asset_name or asset_name == "nan":
+                                continue
+                            if asset_name in asset_name_to_id:
                                 duplicate_count += 1
                                 continue
-                            asset_type = str(row.iloc[1]) if len(row) > 1 else "Other"
-                            if asset_type not in type_list:
-                                add_asset_type(user_email, asset_type)
-                            location = str(row.iloc[2]) if len(row) > 2 else ""
-                            add_asset(user_email, name, asset_type, location)
-                            added_count += 1
-                    st.success(f"Imported {added_count} new assets. {duplicate_count} duplicates skipped.")
-                    st.rerun()
+
+                            # Determine asset type
+                            if type_col != "-- Skip --" and pd.notna(row[type_col]):
+                                asset_type = str(row[type_col]).strip()
+                                if asset_type not in type_list:
+                                    add_asset_type(user_email, asset_type)
+                                    type_list = get_asset_types(user_email)  # refresh list
+                            else:
+                                asset_type = "Other"
+
+                            # Location
+                            if loc_col != "-- Skip --" and pd.notna(row[loc_col]):
+                                location = str(row[loc_col]).strip()
+                            else:
+                                location = ""
+
+                            # Prepare metadata (subnet, vlan, and other columns)
+                            metadata = {}
+                            if subnet_col != "-- Skip --" and pd.notna(row[subnet_col]):
+                                metadata["subnet"] = str(row[subnet_col]).strip()
+                            if vlan_col != "-- Skip --" and pd.notna(row[vlan_col]):
+                                metadata["vlan"] = str(row[vlan_col]).strip()
+                            # Add any other columns that were not mapped
+                            for col in cols:
+                                if col not in [name_col, type_col, loc_col, conn_col, subnet_col, vlan_col] and pd.notna(row[col]):
+                                    metadata[col] = str(row[col]).strip()
+
+                            added, new_id = add_asset(user_email, asset_name, asset_type, location, metadata if metadata else None)
+                            if added:
+                                added_count += 1
+                                asset_name_to_id[asset_name] = new_id
+                            else:
+                                duplicate_count += 1  # should not happen because we already checked
+
+                        # Second pass: create connections from the "connections" column
+                        if conn_col != "-- Skip --":
+                            conn_added = 0
+                            conn_skipped = 0
+                            for _, row in df.iterrows():
+                                asset_name = str(row[name_col]).strip()
+                                if not asset_name or asset_name == "nan":
+                                    continue
+                                source_id = asset_name_to_id.get(asset_name)
+                                if not source_id:
+                                    continue
+                                conn_str = str(row[conn_col]).strip()
+                                if not conn_str or conn_str == "nan":
+                                    continue
+                                # Split by comma, trim whitespace
+                                target_names = [t.strip() for t in conn_str.split(',') if t.strip()]
+                                for target_name in target_names:
+                                    target_id = asset_name_to_id.get(target_name)
+                                    if target_id:
+                                        # Add connection (source -> target) with default type "connected"
+                                        if add_connection(user_email, source_id, target_id, "connected"):
+                                            conn_added += 1
+                                        else:
+                                            conn_skipped += 1
+                                    else:
+                                        conn_skipped += 1
+                            st.info(f"Connections: {conn_added} added, {conn_skipped} skipped (missing target or duplicate).")
+
+                        st.success(f"Imported {added_count} new assets. {duplicate_count} duplicates skipped.")
+                        st.rerun()
+
                 except Exception as e:
                     st.error(f"Error reading file: {e}")
 
