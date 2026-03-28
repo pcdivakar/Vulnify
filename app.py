@@ -4,9 +4,10 @@ import plotly.express as px
 import requests
 from datetime import datetime, timedelta
 import time
-from typing import Dict, List, Optional, Tuple
 import json
+import re
 import groq
+from typing import Dict, List, Optional, Tuple
 
 # ---------- Page Configuration ----------
 st.set_page_config(
@@ -191,22 +192,190 @@ def enrich_cve_data(cve_list: List[Dict]) -> pd.DataFrame:
                 })
     return pd.DataFrame(enriched)
 
-# ---------- LLM Functions ----------
-def llm_summarize(prompt: str) -> str:
-    """Call Groq LLM to generate summary."""
-    if not GROQ_API_KEY:
-        return "LLM features disabled (missing API key)."
-    client = groq.Groq(api_key=GROQ_API_KEY)
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="mixtral-8x7b-32768",
-            temperature=0.3,
-            max_tokens=1024,
-        )
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        return f"LLM error: {e}"
+# ---------- LLM Agent Tools ----------
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_cves",
+            "description": "Search for vulnerabilities by keyword. Returns a list of CVE IDs and brief info.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "The search term (e.g., 'Apache', 'RCE')."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of CVEs to return (default 10)."
+                    }
+                },
+                "required": ["keyword"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_cve_details",
+            "description": "Get full details of a specific CVE including CVSS score, description, EPSS probability, KEV status, and past likelihood.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cve_id": {
+                        "type": "string",
+                        "description": "The CVE ID, e.g., 'CVE-2023-12345'."
+                    }
+                },
+                "required": ["cve_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_kev_catalog",
+            "description": "List vulnerabilities that are in the CISA Known Exploited Vulnerabilities (KEV) catalog. Returns up to 20 entries.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }
+]
+
+def execute_tool(tool_name: str, arguments: Dict) -> str:
+    """Execute the tool and return a string result."""
+    if tool_name == "search_cves":
+        keyword = arguments["keyword"]
+        max_results = arguments.get("max_results", 10)
+        results = search_nvd(keyword, datetime.now() - timedelta(days=365), datetime.now(), max_results)
+        if not results:
+            return f"No CVEs found for '{keyword}'."
+        # Return only essential fields to keep it concise
+        simplified = [{"cve": r["cve"], "description": r["description"][:200]} for r in results]
+        return json.dumps(simplified, indent=2)
+
+    elif tool_name == "get_cve_details":
+        cve_id = arguments["cve_id"]
+        nvd = fetch_nvd_cve(cve_id)
+        if not nvd:
+            return f"CVE {cve_id} not found."
+        epss = fetch_epss(cve_id)
+        kev_list = fetch_kev_catalog()
+        in_kev = is_in_kev(cve_id, kev_list)
+        past_likelihood = get_past_likelihood(nvd["exploitability_score"], in_kev)
+        result = {
+            "cve": cve_id,
+            "cvss_score": nvd["cvss_score"],
+            "description": nvd["description"],
+            "epss": epss,
+            "kev": in_kev,
+            "past_likelihood": past_likelihood
+        }
+        return json.dumps(result, indent=2)
+
+    elif tool_name == "list_kev_catalog":
+        kev_list = fetch_kev_catalog()
+        if not kev_list:
+            return "No KEV entries found."
+        # Return first 20 for brevity
+        short_list = [{"cve": item.get("cveID"), "description": item.get("shortDescription", "")[:100]} for item in kev_list[:20]]
+        return json.dumps(short_list, indent=2)
+
+    else:
+        return f"Unknown tool: {tool_name}"
+
+# ---------- LLM Agent Loop ----------
+def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[str, List[Dict]]:
+    """
+    Process a user message using the agent loop.
+    Returns the final assistant answer and updated conversation history.
+    """
+    # System prompt with tool definitions
+    system_prompt = """You are a cybersecurity vulnerability analyst. You have access to the following tools:
+
+<tools>
+{
+  "name": "search_cves",
+  "description": "Search for vulnerabilities by keyword. Returns a list of CVE IDs and brief info.",
+  "parameters": {
+    "keyword": "string (required)",
+    "max_results": "integer (optional, default 10)"
+  }
+}
+{
+  "name": "get_cve_details",
+  "description": "Get full details of a specific CVE including CVSS score, description, EPSS probability, KEV status, and past likelihood.",
+  "parameters": {
+    "cve_id": "string (required)"
+  }
+}
+{
+  "name": "list_kev_catalog",
+  "description": "List vulnerabilities that are in the CISA Known Exploited Vulnerabilities (KEV) catalog. Returns up to 20 entries.",
+  "parameters": {}
+}
+</tools>
+
+When you need to use a tool, respond with a JSON object in the following format:
+{"tool": "<tool_name>", "arguments": {"param1": "value1", ...}}
+
+If you have enough information to answer the user, respond with a plain text answer (no JSON). Do not add any extra text outside the JSON when using a tool.
+
+Think step by step. Use tools only when necessary. Be concise but thorough.
+"""
+
+    # Build messages list
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(conversation_history)
+    messages.append({"role": "user", "content": user_message})
+
+    max_iterations = 5
+    iteration = 0
+
+    while iteration < max_iterations:
+        # Call Groq
+        client = groq.Groq(api_key=GROQ_API_KEY)
+        try:
+            response = client.chat.completions.create(
+                model="mixtral-8x7b-32768",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            assistant_message = response.choices[0].message.content
+        except Exception as e:
+            return f"Error calling LLM: {e}", conversation_history
+
+        # Try to parse as JSON tool call
+        try:
+            parsed = json.loads(assistant_message)
+            if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
+                tool_name = parsed["tool"]
+                arguments = parsed["arguments"]
+                # Execute the tool
+                tool_result = execute_tool(tool_name, arguments)
+                # Add tool call and result to messages
+                messages.append({"role": "assistant", "content": assistant_message})
+                messages.append({"role": "tool", "content": tool_result})
+                iteration += 1
+                continue  # loop again
+        except json.JSONDecodeError:
+            pass
+
+        # Not a tool call -> final answer
+        # Append final answer to conversation history
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append({"role": "assistant", "content": assistant_message})
+        return assistant_message, conversation_history
+
+    # If we exit loop without final answer, return last message
+    final_message = "I'm sorry, I couldn't resolve your request. Please try again."
+    conversation_history.append({"role": "user", "content": user_message})
+    conversation_history.append({"role": "assistant", "content": final_message})
+    return final_message, conversation_history
 
 # ---------- Streamlit UI ----------
 def main():
@@ -214,7 +383,7 @@ def main():
     st.markdown("Aggregate **CVSS**, **EPSS**, **CISA KEV**, and compute **Past Likelihood (LEV)**. Powered by open‑source LLM (Groq).")
 
     # Sidebar for mode selection
-    mode = st.sidebar.radio("Select Mode", ["Single CVE Lookup", "Search & Dashboard"])
+    mode = st.sidebar.radio("Select Mode", ["Single CVE Lookup", "Search & Dashboard", "AI Agent"])
 
     if mode == "Single CVE Lookup":
         st.header("🔍 Single CVE Lookup")
@@ -233,7 +402,6 @@ def main():
                         in_kev = is_in_kev(cve_input, kev_list)
                         past_likelihood = get_past_likelihood(nvd["exploitability_score"], in_kev)
 
-                        # Display in columns
                         col1, col2 = st.columns(2)
                         with col1:
                             st.subheader("📊 Vulnerability Data")
@@ -245,28 +413,18 @@ def main():
                             st.subheader("📝 Description")
                             st.write(nvd["description"])
 
-                        # LLM Summary
-                        if st.button("Generate AI Summary"):
-                            with st.spinner("Generating summary with Groq..."):
-                                prompt = f"""
-                                You are a cybersecurity analyst. Given the following vulnerability data, provide a concise risk assessment and recommended action.
+                        # Store data for chat agent if needed
+                        st.session_state.last_data = {
+                            "cve": cve_input,
+                            "cvss": nvd["cvss_score"],
+                            "epss": epss,
+                            "kev": in_kev,
+                            "lev": past_likelihood,
+                            "desc": nvd["description"]
+                        }
 
-                                CVE: {cve_input}
-                                CVSS Score: {nvd['cvss_score']}
-                                EPSS Probability: {epss if epss else 'N/A'}
-                                In CISA KEV: {'Yes' if in_kev else 'No'}
-                                Past Likelihood (LEV): {past_likelihood}
-                                Description: {nvd['description']}
-
-                                Please summarize the risk and suggest whether this should be patched urgently.
-                                """
-                                summary = llm_summarize(prompt)
-                                st.markdown("### 🤖 AI Risk Summary")
-                                st.write(summary)
-
-    else:
+    elif mode == "Search & Dashboard":
         st.header("🔎 Search & Dashboard")
-        # Search parameters
         col1, col2, col3 = st.columns(3)
         with col1:
             keyword = st.text_input("Search Keyword (e.g., 'Apache', 'RCE')")
@@ -294,14 +452,12 @@ def main():
 
                         # Visualizations
                         st.subheader("📈 Visualizations")
-                        # Convert CVSS and EPSS to numeric for plotting
                         df_plot = df.copy()
                         df_plot["CVSS Score"] = pd.to_numeric(df_plot["CVSS Score"], errors="coerce")
                         df_plot["EPSS Probability"] = pd.to_numeric(df_plot["EPSS Probability"], errors="coerce")
                         df_plot = df_plot.dropna(subset=["CVSS Score"])
 
                         if not df_plot.empty:
-                            # Bar chart of CVSS scores
                             fig1 = px.bar(
                                 df_plot, x="CVE", y="CVSS Score",
                                 color="Past Likelihood (LEV)",
@@ -311,7 +467,6 @@ def main():
                             )
                             st.plotly_chart(fig1, use_container_width=True)
 
-                            # Scatter plot: CVSS vs EPSS
                             df_scatter = df_plot.dropna(subset=["EPSS Probability"])
                             if not df_scatter.empty:
                                 fig2 = px.scatter(
@@ -322,43 +477,41 @@ def main():
                                 )
                                 st.plotly_chart(fig2, use_container_width=True)
 
-                            # Summary statistics
                             st.subheader("📊 Summary Statistics")
                             col1, col2, col3 = st.columns(3)
                             col1.metric("Avg CVSS Score", f"{df_plot['CVSS Score'].mean():.2f}")
                             col2.metric("Max CVSS Score", f"{df_plot['CVSS Score'].max():.2f}")
                             col3.metric("KEV Count", len(df[df["KEV"] == "Yes"]))
 
-                        # LLM Dashboard Summary
-                        if st.button("Generate AI Dashboard Summary"):
-                            with st.spinner("Generating executive summary..."):
-                                # Prepare a concise prompt with the table summary
-                                summary_stats = {
-                                    "total_cves": len(df),
-                                    "avg_cvss": df_plot["CVSS Score"].mean() if not df_plot.empty else 0,
-                                    "max_cvss": df_plot["CVSS Score"].max() if not df_plot.empty else 0,
-                                    "kev_count": len(df[df["KEV"] == "Yes"]),
-                                    "high_lev_count": len(df[df["Past Likelihood (LEV)"] == "High"]),
-                                }
-                                prompt = f"""
-                                You are a security analyst. Summarize the following vulnerability data for a security team.
+                        # Store data for chat agent if needed
+                        st.session_state.last_data = df
 
-                                Search Keyword: {keyword}
-                                Date Range: {start_date} to {end_date}
+    elif mode == "AI Agent":
+        st.header("🤖 AI Vulnerability Agent")
+        st.markdown("Ask anything about vulnerabilities. The agent will fetch data from NVD, EPSS, and CISA KEV as needed.")
 
-                                Summary:
-                                - Total CVEs found: {summary_stats['total_cves']}
-                                - Average CVSS Score: {summary_stats['avg_cvss']:.2f}
-                                - Maximum CVSS Score: {summary_stats['max_cvss']:.2f}
-                                - Number of CVEs in CISA KEV: {summary_stats['kev_count']}
-                                - Number of CVEs with High Past Likelihood: {summary_stats['high_lev_count']}
+        # Initialize conversation history in session state
+        if "agent_messages" not in st.session_state:
+            st.session_state.agent_messages = []  # list of {"role": "user"/"assistant", "content": ...}
 
-                                Provide a short executive summary highlighting the most critical risks and recommended next steps.
-                                """
-                                summary = llm_summarize(prompt)
-                                st.markdown("### 🤖 Executive Summary")
-                                st.write(summary)
-                    st.success("Dashboard ready!")
+        # Display chat history
+        for msg in st.session_state.agent_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # User input
+        if prompt := st.chat_input("Ask a question..."):
+            # Add user message to UI
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # Process with agent
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    answer, new_history = agent_query(prompt, st.session_state.agent_messages)
+                    st.markdown(answer)
+                    # Update session state with the new history
+                    st.session_state.agent_messages = new_history
 
 if __name__ == "__main__":
     main()
