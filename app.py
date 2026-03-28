@@ -124,7 +124,7 @@ st.markdown("""
 def init_db():
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-    # Users table – now only stores email and last check time (no password)
+    # Users table – now only stores email and last check time
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (email TEXT PRIMARY KEY,
                   name TEXT,
@@ -198,7 +198,6 @@ def safe_float(x):
 
 # ---------- Ensure User in Database ----------
 def ensure_user(email):
-    """If user doesn't exist, create a record."""
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("SELECT email FROM users WHERE email=?", (email,))
@@ -262,6 +261,8 @@ def delete_asset(asset_id):
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("DELETE FROM assets WHERE id=?", (asset_id,))
+    # Also delete any connections involving this asset
+    c.execute("DELETE FROM connections WHERE source_asset_id=? OR target_asset_id=?", (asset_id, asset_id))
     conn.commit()
     conn.close()
 
@@ -302,6 +303,13 @@ def delete_connection(conn_id):
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("DELETE FROM connections WHERE id=?", (conn_id,))
+    conn.commit()
+    conn.close()
+
+def delete_all_connections(email):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM connections WHERE email=?", (email,))
     conn.commit()
     conn.close()
 
@@ -772,7 +780,11 @@ def plot_network_graph(email, type_colors):
     if G.number_of_nodes() == 0:
         return None
 
-    pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
+    # Layout: for single node, center it; for more, use spring layout
+    if G.number_of_nodes() == 1:
+        pos = {list(G.nodes())[0]: (0, 0)}
+    else:
+        pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
 
     edge_x = []
     edge_y = []
@@ -891,7 +903,7 @@ def main():
             st.warning("No assets found. Please add assets in the Asset Manager.")
             return
 
-        # Metrics row (same as before)
+        # Metrics row
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.markdown('<div class="metric-card"><div class="stat-label">Total Vulnerabilities</div><div class="stat-value">{}</div></div>'.format(stats["total_vulns"]), unsafe_allow_html=True)
@@ -1133,6 +1145,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                 conn_df = pd.DataFrame(conn_data)
                 st.dataframe(conn_df, use_container_width=True)
 
+                # Delete individual connection
                 del_id = st.number_input("Connection ID to delete", min_value=0, step=1, key="del_conn_id")
                 if st.button("Delete Connection", key="del_conn_btn"):
                     if del_id > 0 and del_id in conn_df["ID"].values:
@@ -1141,6 +1154,13 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                         st.rerun()
                     else:
                         st.error("Invalid Connection ID.")
+
+                # Delete all connections button
+                if st.button("🗑️ Delete All Connections", key="del_all_conn"):
+                    if st.checkbox("Confirm delete all connections"):
+                        delete_all_connections(user_email)
+                        st.success("All connections deleted.")
+                        st.rerun()
             else:
                 st.info("No connections yet. Add some to model your network.")
 
