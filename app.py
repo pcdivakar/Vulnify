@@ -479,6 +479,7 @@ def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
     return "Unknown"
 
 def build_asset_search_query(asset_name, asset_type, metadata):
+    """Build search query from asset details (excludes asset_id and does not add 'ics')."""
     terms = []
     if asset_name and asset_name != "nan":
         terms.append(asset_name)
@@ -492,10 +493,6 @@ def build_asset_search_query(asset_name, asset_type, metadata):
     # Remove duplicates and empty strings
     terms = list(dict.fromkeys([t.strip() for t in terms if t]))
     query = " ".join(terms)
-    # Boost OT context
-    ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
-    if any(term in query.lower() for term in ot_terms):
-        query += " ics"
     return query
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -988,19 +985,6 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
-        st.markdown("---")
-        st.markdown("### 🧪 Manual Test Search")
-        test_query = st.text_input("Test query (e.g., 'Siemens S7-1200')")
-        if st.button("Test NVD Search"):
-            with st.spinner("Searching NVD..."):
-                results, total = search_nvd(test_query, lookback_months, max_results=5)
-                if results:
-                    st.success(f"Found {total} total CVEs. First 5:")
-                    for r in results:
-                        st.write(f"- {r['cve']}: {r['description'][:100]}...")
-                else:
-                    st.warning("No results. Check query or increase lookback.")
-
     if "user_email" not in st.session_state or not st.session_state.user_email:
         st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
         st.info("👋 Please enter your email in the sidebar to begin.")
@@ -1017,6 +1001,25 @@ def main():
     if page == "Dashboard":
         st.markdown('<div class="main-header">📊 OT Vulnerability Dashboard</div>', unsafe_allow_html=True)
 
+        # Manual NVD Search Panel
+        with st.expander("🔎 Manual NVD Search (by keyword)", expanded=False):
+            st.markdown("Enter keywords to search NVD directly (e.g., 'Siemens S7-1200', 'Modicon M241', 'Rockwell ControlLogix')")
+            manual_query = st.text_input("Search term", placeholder="e.g., Siemens S7-1200")
+            manual_results_limit = st.slider("Max results", min_value=5, max_value=50, value=20, step=5)
+            if st.button("Search NVD", key="manual_search"):
+                if manual_query:
+                    with st.spinner("Searching NVD..."):
+                        cves, total = search_nvd(manual_query, lookback, max_results=manual_results_limit)
+                        if cves:
+                            st.success(f"Found {total} CVEs. Showing first {len(cves)}.")
+                            manual_df = pd.DataFrame(cves)
+                            st.dataframe(manual_df, use_container_width=True)
+                        else:
+                            st.warning("No CVEs found for that query. Try different keywords or increase lookback.")
+                else:
+                    st.warning("Please enter a search term.")
+
+        # Dashboard action buttons
         col_actions = st.columns([1,1,1])
         with col_actions[0]:
             if st.button("🔄 Refresh Data"):
@@ -1049,7 +1052,7 @@ def main():
             return
 
         # Debug expander to see search queries and results
-        with st.expander("🔍 Search Query Debug (first 5 assets)"):
+        with st.expander("🔍 Asset Search Debug (first 5 assets)"):
             for name, query, count in debug_info[:5]:
                 st.write(f"**{name}**: `{query}` → {count} results")
             st.caption("If a query returns zero results, try simplifying the query or increasing the lookback months.")
