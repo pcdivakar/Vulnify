@@ -2,10 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
-import json
 from io import BytesIO
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # -------------------------------
 # Page configuration
@@ -16,7 +14,7 @@ st.markdown("Powered by **NIST NVD v2.0** and **Hugging Face AI**")
 # -------------------------------
 # Session state initialization
 if "results" not in st.session_state:
-    st.session_state.results = []          # list of dicts: asset, cveId, description, severity, score, vector, sevClass, mitigationUrl
+    st.session_state.results = []
 if "hf_token" not in st.session_state:
     st.session_state.hf_token = ""
 if "chat_history" not in st.session_state:
@@ -28,23 +26,33 @@ if "assets_loaded" not in st.session_state:
 # Sidebar: NVD API settings
 with st.sidebar:
     st.header("NVD API Configuration")
-    nvd_api_key = st.text_input("NVD API Key (optional)", type="password", help="Increases rate limit to 50 requests per 30 seconds")
+    nvd_api_key = st.text_input("NVD API Key (optional)", type="password",
+                                help="Increases rate limit to 50 requests per 30 seconds")
     st.markdown("---")
     st.header("Hugging Face AI Assistant")
-    hf_token = st.text_input("Hugging Face API Token", type="password", value=st.session_state.hf_token, help="Get token at huggingface.co/settings/tokens")
+    hf_token = st.text_input("Hugging Face API Token", type="password",
+                             value=st.session_state.hf_token,
+                             help="Get token at huggingface.co/settings/tokens")
     if st.button("Save HF Token"):
         st.session_state.hf_token = hf_token
         st.success("Token saved!")
-    model_name = st.selectbox("Model", ["mistralai/Mistral-7B-Instruct-v0.2", "HuggingFaceH4/zephyr-7b-beta", "google/flan-t5-xl"], index=0)
+    model_name = st.selectbox("Model", [
+        "mistralai/Mistral-7B-Instruct-v0.2",
+        "HuggingFaceH4/zephyr-7b-beta",
+        "google/flan-t5-xl"
+    ], index=0)
 
 # -------------------------------
 # Main area: input panel
 st.header("🔍 Vulnerability Assessment")
 col1, col2 = st.columns(2)
 with col1:
-    asset_input = st.text_area("Manual Asset List", "apache log4j\nwindows server 2019", height=150)
+    asset_input = st.text_area("Manual Asset List",
+                               "apache log4j\nwindows server 2019",
+                               height=150)
 with col2:
-    uploaded_file = st.file_uploader("Import from Excel or CSV", type=["csv", "xlsx", "xls"])
+    uploaded_file = st.file_uploader("Import from Excel or CSV",
+                                     type=["csv", "xlsx", "xls"])
     if uploaded_file:
         try:
             if uploaded_file.name.endswith('.csv'):
@@ -74,7 +82,6 @@ if st.button("🔍 Find CVEs", type="primary"):
             all_cves = []
             progress_bar = st.progress(0)
             for i, asset in enumerate(assets):
-                # Build NVD API URL
                 url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
                 params = {
                     "keywordSearch": asset,
@@ -100,9 +107,9 @@ if st.button("🔍 Find CVEs", type="primary"):
                     for vuln in vulnerabilities:
                         cve = vuln["cve"]
                         cve_id = cve["id"]
-                        desc = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), "No description")
+                        desc = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"),
+                                    "No description")
                         metrics = cve.get("metrics", {})
-                        # Extract CVSS info
                         cvss_data = None
                         if "cvssMetricV31" in metrics and metrics["cvssMetricV31"]:
                             cvss_data = metrics["cvssMetricV31"][0].get("cvssData")
@@ -114,22 +121,23 @@ if st.button("🔍 Find CVEs", type="primary"):
                             score = cvss_data.get("baseScore")
                             severity = cvss_data.get("baseSeverity", "")
                             if not severity:
-                                if score >= 7.0: severity = "HIGH"
-                                elif score >= 4.0: severity = "MEDIUM"
-                                else: severity = "LOW"
+                                if score >= 7.0:
+                                    severity = "HIGH"
+                                elif score >= 4.0:
+                                    severity = "MEDIUM"
+                                else:
+                                    severity = "LOW"
                             vector = cvss_data.get("vectorString", "")
                         else:
                             score = None
                             severity = "N/A"
                             vector = ""
-                        # Map severity to CSS-like class (for display)
                         sev_class = {
                             "CRITICAL": "severity-critical",
                             "HIGH": "severity-high",
                             "MEDIUM": "severity-medium",
                             "LOW": "severity-low"
                         }.get(severity.upper(), "")
-                        # Get mitigation URL (first reference, prefer vendor advisory)
                         refs = cve.get("references", [])
                         mitigation_url = None
                         for ref in refs:
@@ -150,9 +158,8 @@ if st.button("🔍 Find CVEs", type="primary"):
                         })
                 except Exception as e:
                     st.error(f"Error fetching for {asset}: {e}")
-                # Rate limiting
                 time.sleep(0.6 if nvd_api_key else 6.0)
-                progress_bar.progress((i+1)/len(assets))
+                progress_bar.progress((i + 1) / len(assets))
             st.session_state.results = all_cves
             st.session_state.assets_loaded = True
             st.success(f"Found {len(all_cves)} CVEs across {len(assets)} assets.")
@@ -164,7 +171,6 @@ if st.session_state.assets_loaded and st.session_state.results:
     results = st.session_state.results
     df_results = pd.DataFrame(results)
 
-    # Stats
     total = len(results)
     critical = sum(1 for r in results if r["severity"] == "Critical")
     high = sum(1 for r in results if r["severity"] == "High")
@@ -176,7 +182,6 @@ if st.session_state.assets_loaded and st.session_state.results:
     col3.metric("High", high)
     col4.metric("Assets Scanned", assets_count)
 
-    # Severity chart
     severity_counts = {
         "Critical": critical,
         "High": high,
@@ -184,16 +189,15 @@ if st.session_state.assets_loaded and st.session_state.results:
         "Low": sum(1 for r in results if r["severity"] == "Low"),
         "Unknown": sum(1 for r in results if r["severity"] not in ["Critical", "High", "Medium", "Low"])
     }
-    fig = go.Figure(data=[go.Pie(labels=list(severity_counts.keys()), values=list(severity_counts.values()), hole=0.7, marker_colors=["#7f1d1d", "#991b1b", "#b45309", "#065f46", "#64748b"])])
+    fig = go.Figure(data=[go.Pie(labels=list(severity_counts.keys()),
+                                 values=list(severity_counts.values()),
+                                 hole=0.7,
+                                 marker_colors=["#7f1d1d", "#991b1b", "#b45309", "#065f46", "#64748b"])])
     fig.update_layout(title="Severity Distribution", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Scrollable table
     st.subheader("Discovered Vulnerabilities")
-    # Convert to dataframe for display, but we want custom formatting
-    # We'll use st.dataframe with column configuration
     display_df = df_results[["asset", "cveId", "severity", "score", "vector", "description", "mitigationUrl"]].copy()
-    # Add clickable links
     display_df["CVE Link"] = display_df["cveId"].apply(lambda x: f"https://nvd.nist.gov/vuln/detail/{x}")
     display_df["Mitigation"] = display_df["mitigationUrl"].apply(lambda x: f"[Advisory]({x})" if x else "N/A")
     display_df.rename(columns={
@@ -204,7 +208,6 @@ if st.session_state.assets_loaded and st.session_state.results:
         "vector": "Vector",
         "description": "Description"
     }, inplace=True)
-    # Use st.dataframe with height and column config
     st.dataframe(
         display_df[["Asset", "CVE ID", "Risk", "CVSS Score", "Vector", "Description", "Mitigation"]],
         use_container_width=True,
@@ -223,19 +226,15 @@ if st.session_state.assets_loaded and st.session_state.results:
 st.header("🤖 AI Security Assistant")
 st.markdown("Ask questions about CVEs, remediation, or risk analysis. The assistant can use your current dashboard data as context.")
 
-# Display chat history
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Chat input
 if prompt := st.chat_input("Ask about vulnerabilities..."):
-    # Add user message
     st.session_state.chat_history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    
-    # Build context from current CVEs
+
     context = ""
     if st.session_state.results:
         critical_high = [r for r in st.session_state.results if r["severity"] in ["Critical", "High"]]
@@ -244,21 +243,20 @@ if prompt := st.chat_input("Ask about vulnerabilities..."):
             for c in critical_high[:5]:
                 context += f"- {c['cveId']} ({c['severity']}): {c['description'][:120]}...\n"
             context += "\n"
-    # Build prompt for HF model
+
     system = "You are a cybersecurity expert specializing in CVE analysis, risk scoring, and mitigation. Provide concise, actionable advice."
-    model = model_name
-    if "mistral" in model or "zephyr" in model:
+    if "mistral" in model_name or "zephyr" in model_name:
         full_prompt = f"<s>[INST] {system} {context} {prompt} [/INST]"
     else:
         full_prompt = f"{system}\n{context}User: {prompt}\nAssistant:"
-    
-    # Call Hugging Face inference
+
     if not st.session_state.hf_token:
         response = "⚠️ Please provide a Hugging Face API token in the sidebar to enable the AI assistant."
     else:
         with st.spinner("Thinking..."):
             try:
-                api_url = f"https://api-inference.huggingface.co/models/{model}"
+                # NEW HUGGING FACE ROUTER ENDPOINT
+                api_url = f"https://router.huggingface.co/hf-inference/models/{model_name}"
                 headers = {"Authorization": f"Bearer {st.session_state.hf_token}"}
                 payload = {
                     "inputs": full_prompt,
@@ -277,28 +275,25 @@ if prompt := st.chat_input("Ask about vulnerabilities..."):
                     reply = f"❌ API error {resp.status_code}: {resp.text[:200]}"
             except Exception as e:
                 reply = f"❌ Error: {e}"
-    
-    # Add assistant response
+
     st.session_state.chat_history.append({"role": "assistant", "content": reply})
     with st.chat_message("assistant"):
         st.markdown(reply)
 
-# Optional: "Analyze my CVEs" button
 if st.session_state.results and st.button("📊 Analyze my CVEs"):
-    # Automatically send a context-aware prompt
-    context = "Current dashboard shows these critical/high CVEs:\n"
     critical_high = [r for r in st.session_state.results if r["severity"] in ["Critical", "High"]]
+    context = "Current dashboard shows these critical/high CVEs:\n"
     for c in critical_high[:10]:
         context += f"- {c['cveId']} ({c['severity']}): {c['description'][:120]}...\n"
     prompt = f"Please analyze the current vulnerabilities from my dashboard: I have {len(st.session_state.results)} total CVEs (Critical: {sum(1 for r in st.session_state.results if r['severity']=='Critical')}, High: {sum(1 for r in st.session_state.results if r['severity']=='High')}). Give me top 3 remediation priorities and risk summary."
-    # Add user message automatically
+
     st.session_state.chat_history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
-    # Call AI
+
     with st.spinner("Analyzing..."):
         try:
-            api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+            api_url = f"https://router.huggingface.co/hf-inference/models/{model_name}"
             headers = {"Authorization": f"Bearer {st.session_state.hf_token}"}
             payload = {
                 "inputs": prompt,
@@ -317,11 +312,11 @@ if st.session_state.results and st.button("📊 Analyze my CVEs"):
                 reply = f"❌ API error {resp.status_code}: {resp.text[:200]}"
         except Exception as e:
             reply = f"❌ Error: {e}"
+
     st.session_state.chat_history.append({"role": "assistant", "content": reply})
     with st.chat_message("assistant"):
         st.markdown(reply)
     st.rerun()
 
-# Footer
 st.markdown("---")
 st.markdown("Data from NIST NVD. AI responses are generated and should be verified.")
