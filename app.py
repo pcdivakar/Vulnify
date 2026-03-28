@@ -792,8 +792,13 @@ def get_latest_cves_for_assets(user_email, limit=5):
             enriched = enrich_cve(item["cve"], kev_list)
             if enriched:
                 enriched["asset"] = asset_name
+                # Convert cvss_score to float for sorting
+                try:
+                    enriched["cvss_score"] = float(enriched["cvss_score"])
+                except:
+                    enriched["cvss_score"] = 0.0
                 all_cves.append(enriched)
-    all_cves.sort(key=lambda x: safe_float(x.get("cvss_score", 0)), reverse=True)
+    all_cves.sort(key=lambda x: x.get("cvss_score", 0), reverse=True)
     return all_cves[:limit]
 
 # ---------- Network Graph Visualization ----------
@@ -841,16 +846,16 @@ def plot_network_graph(email):
         )
     )
 
-    fig = go.Figure(data=[edge_trace, node_trace],
-                    layout=go.Layout(
-                        title='Network Architecture',
-                        titlefont_size=16,
-                        showlegend=False,
-                        hovermode='closest',
-                        margin=dict(b=20, l=5, r=5, t=40),
-                        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
-                    )
+    fig = go.Figure(data=[edge_trace, node_trace])
+    fig.update_layout(
+        title='Network Architecture',
+        title_font_size=16,
+        showlegend=False,
+        hovermode='closest',
+        margin=dict(b=20, l=5, r=5, t=40),
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+    )
     return fig
 
 # ---------- Main App ----------
@@ -929,7 +934,7 @@ def main():
                       x="asset", y="count", title="")
         st.plotly_chart(fig3, use_container_width=True)
 
-        # ---------- EPSS Proactive Analysis ----------
+        # EPSS Proactive Analysis
         asset_epss = get_asset_epss_summary(user_email, df)
         if not asset_epss.empty:
             st.subheader("🚨 Assets with Highest Exploitation Probability (EPSS)")
@@ -961,6 +966,8 @@ Assets and their top vulnerabilities (EPSS > 0.5):
         latest_cves = get_latest_cves_for_assets(user_email, limit=10)
         if latest_cves:
             latest_df = pd.DataFrame(latest_cves)
+            latest_df["cvss_score"] = pd.to_numeric(latest_df["cvss_score"], errors="coerce")
+            latest_df["epss"] = pd.to_numeric(latest_df["epss"], errors="coerce")
             latest_df = latest_df[["asset", "cve", "cvss_score", "epss", "kev", "description"]]
             latest_df["cvss_score"] = latest_df["cvss_score"].round(1)
             latest_df["epss"] = latest_df["epss"].round(4)
@@ -972,6 +979,8 @@ Assets and their top vulnerabilities (EPSS > 0.5):
         # Detailed table
         st.subheader("Detailed Vulnerability List")
         display_df = df[["asset", "cve", "cvss_score", "epss", "risk", "description"]].copy()
+        display_df["cvss_score"] = pd.to_numeric(display_df["cvss_score"], errors="coerce")
+        display_df["epss"] = pd.to_numeric(display_df["epss"], errors="coerce")
         display_df["cvss_score"] = display_df["cvss_score"].round(1)
         display_df["epss"] = display_df["epss"].round(4)
         st.dataframe(display_df, use_container_width=True)
