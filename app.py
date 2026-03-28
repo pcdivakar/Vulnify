@@ -443,6 +443,14 @@ def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Op
     max_results = int(max_results)
     results = []
     start_index = 0
+
+    # If no dates provided, default to last 2 years (to show recent CVEs only)
+    if start_date is None:
+        start_date = datetime.now() - timedelta(days=730)
+    if end_date is None:
+        end_date = datetime.now()
+
+    # Enhance OT context
     ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
     if any(term in keyword.lower() for term in ot_terms):
         keyword += " ics"
@@ -451,13 +459,11 @@ def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Op
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         params = {
             "keywordSearch": keyword,
+            "pubStartDate": start_date.strftime("%Y-%m-%dT00:00:00.000Z"),
+            "pubEndDate": end_date.strftime("%Y-%m-%dT23:59:59.999Z"),
             "startIndex": start_index,
             "resultsPerPage": min(50, max_results - len(results)),
         }
-        if start_date:
-            params["pubStartDate"] = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
-        if end_date:
-            params["pubEndDate"] = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
 
         headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
         try:
@@ -571,54 +577,137 @@ def check_new_alerts(user_email):
         conn.close()
         return False, "No new vulnerabilities found."
 
-# ---------- LLM Agent Tools ----------
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_vulnerabilities",
-            "description": "Search for vulnerabilities by keyword, with optional OT focus.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {"type": "string", "description": "Search term"},
-                    "max_results": {"type": "integer", "description": "Max CVEs to return (default 10)"}
-                },
-                "required": ["keyword"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_cve_details",
-            "description": "Get full details of a specific CVE.",
-            "parameters": {
-                "type": "object",
-                "properties": {"cve_id": {"type": "string", "description": "CVE ID"}},
-                "required": ["cve_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_kev_catalog",
-            "description": "List CVEs in CISA KEV catalog.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_ics_advisories",
-            "description": "Get recent ICS-CERT advisories.",
-            "parameters": {"type": "object", "properties": {}}
-        }
+# ---------- LLM Agent (without tool calls for explanation) ----------
+def simple_llm_query(prompt: str) -> str:
+    """Call LLM without tools (used for AI explanation)."""
+    if not GROQ_API_KEY:
+        return "Groq API key not configured."
+    client = groq.Groq(api_key=GROQ_API_KEY)
+    try:
+        response = client.chat.completions.create(
+            model="mixtral-8x7b-32768",  # More reliable for simple prompts
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error: {e}"
+
+def agent_query(user_message: str, conversation_history: List[Dict], network_context: str = "") -> Tuple[str, List[Dict]]:
+    """Full AI Agent with tools (used for chat)."""
+    if not GROQ_API_KEY:
+        return "Groq API key not configured. AI Agent disabled.", conversation_history
+
+    messages = []
+    messages.extend(conversation_history)
+    messages.append({"role": "user", "content": user_message})
+
+    system_prompt = {
+        "role": "system",
+        "content": f"""You are an OT/ICS cybersecurity analyst. You have access to tools to search for CVEs, get details, list KEV, and get ICS advisories.
+If the user asks about a specific asset, use the network architecture information provided below to understand upstream/downstream dependencies and predict impact propagation.
+
+Network Architecture:
+{network_context}
+
+When using tools, ensure numeric parameters are integers (no quotes). Consider OT/ICS implications and network dependencies in your answers."""
     }
-]
+    if not messages or messages[0].get("role") != "system":
+        messages.insert(0, system_prompt)
+
+    # Tool definitions (same as before)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_vulnerabilities",
+                "description": "Search for vulnerabilities by keyword, with optional OT focus.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keyword": {"type": "string", "description": "Search term"},
+                        "max_results": {"type": "integer", "description": "Max CVEs to return (default 10)"}
+                    },
+                    "required": ["keyword"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_cve_details",
+                "description": "Get full details of a specific CVE.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cve_id": {"type": "string", "description": "CVE ID"}},
+                    "required": ["cve_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_kev_catalog",
+                "description": "List CVEs in CISA KEV catalog.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_ics_advisories",
+                "description": "Get recent ICS-CERT advisories.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }
+    ]
+
+    max_iterations = 10
+    iteration = 0
+
+    while iteration < max_iterations:
+        client = groq.Groq(api_key=GROQ_API_KEY)
+        try:
+            response = client.chat.completions.create(
+                model="mixtral-8x7b-32768",  # More reliable for tool calls
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.2,
+                max_tokens=1024,
+            )
+            assistant_message = response.choices[0].message
+        except Exception as e:
+            return f"Error calling LLM: {e}", conversation_history
+
+        if assistant_message.tool_calls:
+            messages.append(assistant_message)
+            for tool_call in assistant_message.tool_calls:
+                tool_name = tool_call.function.name
+                arguments = json.loads(tool_call.function.arguments)
+                # Execute the tool (implemented earlier)
+                tool_result = execute_tool(tool_name, arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result,
+                })
+            iteration += 1
+            continue
+        else:
+            final_answer = assistant_message.content
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": final_answer})
+            return final_answer, conversation_history
+
+    final_message = "I'm sorry, I couldn't resolve your request. Please try again."
+    conversation_history.append({"role": "user", "content": user_message})
+    conversation_history.append({"role": "assistant", "content": final_message})
+    return final_message, conversation_history
 
 def execute_tool(tool_name: str, arguments: Dict) -> str:
+    """Re‑implement tool execution (needed for the agent)."""
     if tool_name == "search_vulnerabilities":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
@@ -664,68 +753,17 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
     else:
         return f"Unknown tool: {tool_name}"
 
-def agent_query(user_message: str, conversation_history: List[Dict], network_context: str = "") -> Tuple[str, List[Dict]]:
-    if not GROQ_API_KEY:
-        return "Groq API key not configured. AI Agent disabled.", conversation_history
-
-    messages = []
-    messages.extend(conversation_history)
-    messages.append({"role": "user", "content": user_message})
-
-    system_prompt = {
-        "role": "system",
-        "content": f"""You are an OT/ICS cybersecurity analyst. You have access to tools to search for CVEs, get details, list KEV, and get ICS advisories.
-If the user asks about a specific asset, use the network architecture information provided below to understand upstream/downstream dependencies and predict impact propagation.
-
-Network Architecture:
-{network_context}
-
-When using tools, ensure numeric parameters are integers (no quotes). Consider OT/ICS implications and network dependencies in your answers."""
-    }
-    if not messages or messages[0].get("role") != "system":
-        messages.insert(0, system_prompt)
-
-    max_iterations = 10
-    iteration = 0
-
-    while iteration < max_iterations:
-        client = groq.Groq(api_key=GROQ_API_KEY)
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.2,
-                max_tokens=1024,
-            )
-            assistant_message = response.choices[0].message
-        except Exception as e:
-            return f"Error calling LLM: {e}", conversation_history
-
-        if assistant_message.tool_calls:
-            messages.append(assistant_message)
-            for tool_call in assistant_message.tool_calls:
-                tool_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
-                tool_result = execute_tool(tool_name, arguments)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result,
-                })
-            iteration += 1
-            continue
-        else:
-            final_answer = assistant_message.content
-            conversation_history.append({"role": "user", "content": user_message})
-            conversation_history.append({"role": "assistant", "content": final_answer})
-            return final_answer, conversation_history
-
-    final_message = "I'm sorry, I couldn't resolve your request. Please try again."
-    conversation_history.append({"role": "user", "content": user_message})
-    conversation_history.append({"role": "assistant", "content": final_message})
-    return final_message, conversation_history
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_ics_advisories() -> List[Dict]:
+    """Fetch ICS-CERT advisories from CISA."""
+    url = "https://www.cisa.gov/sites/default/files/feeds/ics-advisories.json"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("advisories", [])
+    except Exception:
+        pass
+    return []
 
 # ---------- Dashboard Functions ----------
 def analyze_assets(user_email):
@@ -949,6 +987,7 @@ def main():
             with col2:
                 st.markdown("**Why these assets are high risk:**")
                 if st.button("Generate AI Explanation", key="epss_btn"):
+                    # Fetch data directly (no tool call)
                     top_assets = asset_epss.head(5)["asset"].tolist()
                     vuln_data = df[df["asset"].isin(top_assets)][["asset", "cve", "epss", "description"]].head(20)
                     prompt = f"""
@@ -958,7 +997,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
 {vuln_data.to_string()}
 """
                     with st.spinner("Generating explanation..."):
-                        explanation, _ = agent_query(prompt, [], "")
+                        explanation = simple_llm_query(prompt)
                         st.write(explanation)
 
         # Latest relevant CVEs
