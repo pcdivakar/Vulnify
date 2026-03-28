@@ -336,11 +336,11 @@ Think step by step. Use tools only when necessary. Be concise but thorough.
     iteration = 0
 
     while iteration < max_iterations:
-        # Call Groq
+        # Call Groq – using stable production model (llama-3.3-70b-versatile)
         client = groq.Groq(api_key=GROQ_API_KEY)
         try:
             response = client.chat.completions.create(
-                model="mixtral-8x7b-32768",
+                model="llama-3.3-70b-versatile",   # Production model (replaces deprecated mixtral)
                 messages=messages,
                 temperature=0.2,
                 max_tokens=1024,
