@@ -157,13 +157,12 @@ def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
     }
 
 def analyze_assets(df, column_map, lookback_months=24):
-    """Analyze each asset, return (vuln_df, debug_info)."""
+    """Analyze each asset using mapped columns (asset_name, asset_type, vendor, model)."""
     kev_list = fetch_kev_catalog()
     all_vulns = []
     debug_info = []  # (asset_name, query, results_count)
     for _, row in df.iterrows():
         terms = []
-        # Use only asset_name, asset_type, vendor, model (no firmware)
         for field in ["asset_name", "asset_type", "vendor", "model"]:
             col = column_map.get(field)
             if col and pd.notna(row[col]) and str(row[col]).strip():
@@ -180,6 +179,25 @@ def analyze_assets(df, column_map, lookback_months=24):
                 enriched["asset_type"] = row.get(column_map.get("asset_type", ""), "")
                 enriched["vendor"] = row.get(column_map.get("vendor", ""), "")
                 enriched["model"] = row.get(column_map.get("model", ""), "")
+                all_vulns.append(enriched)
+    df_vulns = pd.DataFrame(all_vulns)
+    return df_vulns, debug_info
+
+def manual_asset_search(asset_names, lookback_months=24):
+    """Process a list of asset names (strings) and return vulnerabilities DataFrame."""
+    kev_list = fetch_kev_catalog()
+    all_vulns = []
+    debug_info = []
+    for asset_name in asset_names:
+        query = asset_name.strip()
+        if not query:
+            continue
+        cve_list, total_count = search_nvd(query, max_results=10, lookback_months=lookback_months)
+        debug_info.append((asset_name, query, total_count))
+        for cve_info in cve_list:
+            enriched = enrich_cve(cve_info["cve"], kev_list)
+            if enriched:
+                enriched["asset"] = asset_name
                 all_vulns.append(enriched)
     df_vulns = pd.DataFrame(all_vulns)
     return df_vulns, debug_info
@@ -282,7 +300,7 @@ def main():
         st.session_state.lookback_months = lookback_months
 
         st.markdown("---")
-        st.subheader("🔎 Manual Test Search")
+        st.subheader("🔎 Quick Keyword Test")
         test_keyword = st.text_input("Enter a keyword (e.g., 'Siemens S7-1200')")
         if st.button("Test NVD Search"):
             if test_keyword:
@@ -295,8 +313,89 @@ def main():
                     else:
                         st.warning("No results. Try different keywords or increase lookback.")
 
-    # File upload
-    uploaded_file = st.file_uploader("Choose file", type=["xlsx", "csv"])
+    # ---------- Manual Asset Search (like the HTML tool) ----------
+    st.markdown("## 🔎 Manual Asset Search (like the HTML tool)")
+    with st.expander("Click to expand – Enter assets manually or upload a file", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            asset_text = st.text_area("Asset names (one per line)", height=150, key="manual_assets")
+        with col2:
+            uploaded_file_manual = st.file_uploader("Or upload Excel/CSV (first column used)", type=["xlsx", "csv"], key="manual_file")
+            if uploaded_file_manual:
+                try:
+                    if uploaded_file_manual.name.endswith('.csv'):
+                        df_manual = pd.read_csv(uploaded_file_manual)
+                    else:
+                        df_manual = pd.read_excel(uploaded_file_manual)
+                    # Take first column as asset names
+                    asset_names_from_file = df_manual.iloc[:, 0].dropna().astype(str).tolist()
+                    asset_text = "\n".join(asset_names_from_file)
+                    st.success(f"Loaded {len(asset_names_from_file)} assets from file.")
+                except Exception as e:
+                    st.error(f"Error reading file: {e}")
+
+        if st.button("Find CVEs", key="manual_search_btn"):
+            assets = [line.strip() for line in asset_text.split("\n") if line.strip()]
+            if not assets:
+                st.warning("Please enter at least one asset name.")
+            else:
+                with st.spinner("Searching NVD..."):
+                    df_vulns, debug_info = manual_asset_search(assets, lookback_months=lookback_months)
+
+                # Display debug info
+                with st.expander("🔍 Search Query Debug (manual)"):
+                    for name, query, count in debug_info:
+                        st.write(f"**{name}**: `{query}` → {count} results")
+                    st.caption("If a query returns zero results, try simplifying the query or increasing lookback.")
+
+                if df_vulns.empty:
+                    st.warning("No vulnerabilities found for the entered assets.")
+                else:
+                    st.success(f"Found {len(df_vulns)} vulnerabilities for {len(assets)} assets.")
+
+                    # Summary stats
+                    total = len(df_vulns)
+                    critical = len(df_vulns[df_vulns["cvss_score"] >= 9.0])
+                    high = len(df_vulns[(df_vulns["cvss_score"] >= 7.0) & (df_vulns["cvss_score"] < 9.0)])
+                    assets_affected = df_vulns["asset"].nunique()
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total CVEs", total)
+                    with col2:
+                        st.metric("Critical", critical)
+                    with col3:
+                        st.metric("High", high)
+                    with col4:
+                        st.metric("Assets Affected", assets_affected)
+
+                    # Severity distribution chart (doughnut)
+                    severity_counts = {
+                        "Critical": critical,
+                        "High": high,
+                        "Medium": len(df_vulns[(df_vulns["cvss_score"] >= 4.0) & (df_vulns["cvss_score"] < 7.0)]),
+                        "Low": len(df_vulns[df_vulns["cvss_score"] < 4.0])
+                    }
+                    fig = px.pie(
+                        names=list(severity_counts.keys()),
+                        values=list(severity_counts.values()),
+                        title="Severity Distribution",
+                        color=list(severity_counts.keys()),
+                        color_discrete_map={"Critical": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"}
+                    )
+                    fig.update_traces(textposition='inside', textinfo='percent+label', hole=0.4)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # Table of results
+                    st.subheader("Vulnerability Details")
+                    display_df = df_vulns[["asset", "cve", "cvss_score", "epss", "kev", "description"]].copy()
+                    display_df["cvss_score"] = pd.to_numeric(display_df["cvss_score"], errors="coerce").round(1)
+                    display_df["epss"] = pd.to_numeric(display_df["epss"], errors="coerce").round(4)
+                    display_df["kev"] = display_df["kev"].apply(lambda x: "Yes" if x else "No")
+                    st.dataframe(display_df, use_container_width=True)
+
+    # ---------- Main Analysis (with column mapping) ----------
+    st.markdown("## 📊 Detailed Asset Analysis (with column mapping)")
+    uploaded_file = st.file_uploader("Choose Excel/CSV file", type=["xlsx", "csv"], key="main_file")
     if uploaded_file:
         try:
             if uploaded_file.name.endswith('.csv'):
@@ -319,7 +418,6 @@ def main():
                 with col2:
                     col_map["asset_type"] = st.selectbox("Asset Type (optional)", ["-- None --"] + cols, index=0)
                     col_map["model"] = st.selectbox("Model (optional)", ["-- None --"] + cols, index=0)
-                # No firmware mapping
                 submit = st.form_submit_button("Analyze Assets")
 
             if submit:
@@ -341,7 +439,7 @@ def main():
                         st.session_state.asset_context += f"\nTop CVEs:\n{df_vulns[['cve','cvss_score','kev','description']].head(10).to_string()}"
 
                 # Debug expander
-                with st.expander("🔍 Search Query Debug"):
+                with st.expander("🔍 Search Query Debug (mapped assets)"):
                     for name, query, count in debug_info:
                         st.write(f"**{name}**: `{query}` → {count} results")
                     st.caption("If a query returns zero results, try simplifying the query (use fewer terms) or increasing the lookback months.")
