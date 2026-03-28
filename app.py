@@ -121,17 +121,26 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Database Setup ----------
+# ---------- Database Setup with Schema Upgrade ----------
 def init_db():
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
+
+    # Create users table with verified column if it doesn't exist
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (email TEXT PRIMARY KEY,
                   password TEXT,
                   name TEXT,
-                  verified INTEGER DEFAULT 0,
                   created_at TIMESTAMP,
                   last_alert_check TIMESTAMP)''')
+    # Add verified column if not present
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        # Column already exists – ignore
+        pass
+
+    # Create other tables
     c.execute('''CREATE TABLE IF NOT EXISTS assets
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   email TEXT,
@@ -159,14 +168,13 @@ def init_db():
                   type_name TEXT,
                   is_default INTEGER,
                   created_at TIMESTAMP)''')
-    # Table for temporary OTP storage
     c.execute('''CREATE TABLE IF NOT EXISTS pending_verifications
                  (email TEXT PRIMARY KEY,
                   otp TEXT,
                   name TEXT,
                   password TEXT,
                   created_at TIMESTAMP)''')
-    conn.commit()
+
     # Pre‑populate default asset types if not already present
     default_types = ["PLC", "RTU", "HMI", "SCADA", "Gateway", "IED", "VFD", "UPS", "Historian", "Engineering Workstation"]
     for dt in default_types:
@@ -174,6 +182,7 @@ def init_db():
         if not c.fetchone():
             c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (NULL, ?, 1, ?)",
                       (dt, datetime.now()))
+
     conn.commit()
     conn.close()
 
