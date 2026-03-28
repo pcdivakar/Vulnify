@@ -125,10 +125,13 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
     start_index = 0
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+        # Format dates with Z suffix (UTC)
+        pub_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
+        pub_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
         params = {
             "keywordSearch": keyword,
-            "pubStartDate": start_date.strftime("%Y-%m-%dT00:00:00.000"),
-            "pubEndDate": end_date.strftime("%Y-%m-%dT23:59:59.999"),
+            "pubStartDate": pub_start,
+            "pubEndDate": pub_end,
             "startIndex": start_index,
             "resultsPerPage": min(50, max_results - len(results)),
         }
@@ -154,6 +157,10 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
                     break
                 # Respect rate limits
                 time.sleep(0.2)
+            elif resp.status_code == 404:
+                # 404 usually means no results or invalid parameters
+                st.warning(f"NVD search returned 404 – no results for '{keyword}'.")
+                break
             else:
                 st.error(f"NVD search error {resp.status_code}")
                 break
