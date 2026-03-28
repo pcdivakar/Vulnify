@@ -45,7 +45,7 @@ try:
 except:
     SMTP_SERVER = None
 
-# ---------- Custom CSS for Corporate Light Theme ----------
+# ---------- Custom CSS for Professional Corporate Theme ----------
 st.markdown("""
 <style>
     .stApp {
@@ -117,6 +117,14 @@ st.markdown("""
         overflow: hidden;
         border: 1px solid #e5e7eb;
     }
+    .graph-container {
+        background: white;
+        border-radius: 12px;
+        padding: 1rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        border: 1px solid #e5e7eb;
+        margin-bottom: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -124,7 +132,6 @@ st.markdown("""
 def init_db():
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-    # Users table – now only stores email and last check time
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (email TEXT PRIMARY KEY,
                   name TEXT,
@@ -158,7 +165,7 @@ def init_db():
                   is_default INTEGER,
                   created_at TIMESTAMP)''')
     conn.commit()
-    # Pre‑populate default asset types if not already present
+    # Pre‑populate default asset types
     default_types = ["PLC", "RTU", "HMI", "SCADA", "Gateway", "IED", "VFD", "UPS", "Historian", "Engineering Workstation"]
     for dt in default_types:
         c.execute("SELECT id FROM asset_types WHERE email IS NULL AND type_name=? AND is_default=1", (dt,))
@@ -261,8 +268,15 @@ def delete_asset(asset_id):
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("DELETE FROM assets WHERE id=?", (asset_id,))
-    # Also delete any connections involving this asset
     c.execute("DELETE FROM connections WHERE source_asset_id=? OR target_asset_id=?", (asset_id, asset_id))
+    conn.commit()
+    conn.close()
+
+def delete_all_assets(email):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM assets WHERE email=?", (email,))
+    c.execute("DELETE FROM connections WHERE email=?", (email,))
     conn.commit()
     conn.close()
 
@@ -775,25 +789,30 @@ def get_latest_cves_for_assets(user_email, limit=5):
     return all_cves[:limit]
 
 # ---------- Network Graph Visualization ----------
-def plot_network_graph(email, type_colors):
+def plot_network_graph(email, type_colors, seed=None):
     G = build_network_graph(email)
     if G.number_of_nodes() == 0:
         return None
 
-    # Layout: for single node, center it; for more, use spring layout
-    if G.number_of_nodes() == 1:
-        pos = {list(G.nodes())[0]: (0, 0)}
-    else:
-        pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
+    if seed is None:
+        seed = 42
+    # Use a larger k to spread nodes more
+    pos = nx.spring_layout(G, k=3, iterations=80, seed=seed)
 
+    # Prepare edge traces with hover text for relationship type
     edge_x = []
     edge_y = []
+    edge_text = []
     for edge in G.edges():
         x0, y0 = pos[edge[0]]
         x1, y1 = pos[edge[1]]
         edge_x.extend([x0, x1, None])
         edge_y.extend([y0, y1, None])
+        rel = G.edges[edge].get("relationship", "connected")
+        edge_text.append(rel)
 
+    # We'll add edge text as annotations (simpler to add hover)
+    # For now, just use a separate trace for edge labels (optional)
     edge_trace = go.Scatter(
         x=edge_x, y=edge_y,
         line=dict(width=1.5, color='#888'),
@@ -805,6 +824,7 @@ def plot_network_graph(email, type_colors):
     node_y = []
     node_text = []
     node_colors = []
+    node_sizes = []
     for node in G.nodes():
         x, y = pos[node]
         node_x.append(x)
@@ -813,6 +833,8 @@ def plot_network_graph(email, type_colors):
         asset_type = node_data['type']
         color = type_colors.get(asset_type, "#aaaaaa")
         node_colors.append(color)
+        # Use larger size for nodes with many connections? Not needed now.
+        node_sizes.append(40)
         node_text.append(
             f"<b>{node_data['name']}</b><br>Type: {asset_type}<br>Location: {node_data['location']}"
         )
@@ -824,7 +846,7 @@ def plot_network_graph(email, type_colors):
         textposition="top center",
         hoverinfo='text',
         marker=dict(
-            size=40,
+            size=node_sizes,
             color=node_colors,
             line=dict(width=2, color='white')
         )
@@ -838,7 +860,8 @@ def plot_network_graph(email, type_colors):
         margin=dict(b=20, l=20, r=20, t=20),
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        plot_bgcolor='white'
+        plot_bgcolor='white',
+        paper_bgcolor='white'
     )
     return fig
 
@@ -882,19 +905,31 @@ def main():
     if page == "Dashboard":
         st.markdown('<div class="main-header">📊 OT Vulnerability Dashboard</div>', unsafe_allow_html=True)
 
-        # On first load of the session, check for new alerts
+        # Dashboard action buttons
+        col_actions = st.columns([1,1,1])
+        with col_actions[0]:
+            if st.button("🔄 Refresh Data", help="Re‑fetch vulnerabilities for all assets"):
+                # Clear cache for search_nvd (or just rerun)
+                st.cache_data.clear()
+                st.rerun()
+        with col_actions[1]:
+            if st.button("📧 Check Alerts", help="Manually check for new vulnerabilities and send email"):
+                with st.spinner("Checking..."):
+                    sent, msg = check_new_alerts(user_email)
+                    st.success(msg)
+        with col_actions[2]:
+            if st.button("🗑️ Clear All Assets", help="Delete all your assets and connections"):
+                if st.checkbox("Confirm delete all assets?"):
+                    delete_all_assets(user_email)
+                    st.success("All assets and connections deleted.")
+                    st.rerun()
+
+        # On first load of the session, check for new alerts (only once)
         if "alert_checked" not in st.session_state:
             with st.spinner("Checking for new vulnerabilities..."):
                 _, msg = check_new_alerts(user_email)
                 st.info(msg)
                 st.session_state.alert_checked = True
-
-        col1, col2 = st.columns([1, 5])
-        with col1:
-            if st.button("🔄 Check for New Alerts"):
-                with st.spinner("Checking..."):
-                    sent, msg = check_new_alerts(user_email)
-                    st.success(msg)
 
         with st.spinner("Analyzing your assets..."):
             df, stats = analyze_assets(user_email)
@@ -1096,14 +1131,23 @@ Assets and their top vulnerabilities (EPSS > 0.5):
 
             # Graph visualization (scrollable)
             st.subheader("Network Graph")
-            fig = plot_network_graph(user_email, type_colors)
+            # Layout seed for reset
+            if "graph_seed" not in st.session_state:
+                st.session_state.graph_seed = 42
+
+            fig = plot_network_graph(user_email, type_colors, seed=st.session_state.graph_seed)
             if fig:
+                # Add reset layout button
+                if st.button("🔄 Reset Graph Layout"):
+                    st.session_state.graph_seed = random.randint(1, 10000)
+                    st.rerun()
                 st.markdown(
-                    '<div style="height: 500px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 12px;">',
+                    '<div class="graph-container">',
                     unsafe_allow_html=True
                 )
-                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True})
                 st.markdown('</div>', unsafe_allow_html=True)
+                st.caption("💡 Tip: Use the toolbar to zoom, pan, and download the graph as an image.")
             else:
                 st.info("Not enough nodes to display graph (need at least one asset).")
 
