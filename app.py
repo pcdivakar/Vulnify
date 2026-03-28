@@ -5,7 +5,6 @@ import requests
 from datetime import datetime, timedelta
 import time
 import json
-import re
 import uuid
 import groq
 from typing import Dict, List, Optional, Tuple
@@ -18,9 +17,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------- Load Secrets ----------
+# ---------- Load Secrets (optional) ----------
 try:
-    NVD_API_KEY = st.secrets["NVD_API_KEY"]
+    NVD_API_KEY = st.secrets.get("NVD_API_KEY", None)
 except:
     NVD_API_KEY = None
 
@@ -30,13 +29,19 @@ except:
     GROQ_API_KEY = None
     st.warning("Groq API key not found. LLM features will be disabled.")
 
+# ---------- API Key Status in Sidebar ----------
+with st.sidebar:
+    if NVD_API_KEY:
+        st.success("✅ NVD API key loaded")
+    else:
+        st.info("ℹ️ No NVD API key – using public rate limits (5 req/30 sec).")
+    if not GROQ_API_KEY:
+        st.error("❌ Groq API key required for AI Agent. Add it in Secrets.")
+
 # ---------- Cached API Functions ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nvd_cve(cve_id: str) -> Optional[Dict]:
-    """
-    Fetch a single CVE from NVD.
-    Returns dict with cvss_score, exploitability_score, description.
-    """
+    """Fetch a single CVE from NVD."""
     url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
     headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
     try:
@@ -89,14 +94,12 @@ def fetch_kev_catalog() -> List[Dict]:
     return []
 
 def is_in_kev(cve_id: str, kev_list: List[Dict]) -> bool:
-    """Check if CVE is present in KEV list."""
     for item in kev_list:
         if item.get("cveID") == cve_id:
             return True
     return False
 
 def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
-    """Compute LEV from CVSS exploitability subscore and KEV status."""
     if in_kev:
         return "Confirmed (KEV)"
     if exploitability_score != "N/A":
@@ -114,18 +117,11 @@ def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_results: int = 50) -> List[Dict]:
-    """
-    Search NVD with keyword and date range. Returns list of CVE summaries.
-    Implements basic pagination.
-    """
-    # Ensure max_results is integer (in case it's passed as string)
     max_results = int(max_results)
-
     results = []
     start_index = 0
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-        # Format dates with Z suffix (UTC)
         pub_start = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
         pub_end = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
         params = {
@@ -150,15 +146,12 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
                         "description": cve["descriptions"][0]["value"],
                         "published": cve["published"],
                     })
-                # Check if there are more results
                 total = data.get("totalResults", 0)
                 start_index += len(vulns)
                 if start_index >= total:
                     break
-                # Respect rate limits
-                time.sleep(0.2)
+                time.sleep(0.2)  # Avoid hitting rate limits
             elif resp.status_code == 404:
-                # 404 usually means no results or invalid parameters
                 st.warning(f"NVD search returned 404 – no results for '{keyword}'.")
                 break
             else:
@@ -170,10 +163,6 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
     return results[:max_results]
 
 def enrich_cve_data(cve_list: List[Dict]) -> pd.DataFrame:
-    """
-    Given a list of CVE dicts (with at least 'cve'), fetch full details,
-    EPSS, and KEV status. Returns a DataFrame.
-    """
     kev_list = fetch_kev_catalog()
     enriched = []
     for cve_info in cve_list:
@@ -213,14 +202,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {
-                        "type": "string",
-                        "description": "The search term (e.g., 'Apache', 'RCE')."
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of CVEs to return (default 10)."
-                    }
+                    "keyword": {"type": "string", "description": "The search term (e.g., 'Apache', 'RCE')."},
+                    "max_results": {"type": "integer", "description": "Maximum number of CVEs to return (default 10)."}
                 },
                 "required": ["keyword"]
             }
@@ -234,10 +217,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cve_id": {
-                        "type": "string",
-                        "description": "The CVE ID, e.g., 'CVE-2023-12345'."
-                    }
+                    "cve_id": {"type": "string", "description": "The CVE ID, e.g., 'CVE-2023-12345'."}
                 },
                 "required": ["cve_id"]
             }
@@ -248,16 +228,12 @@ TOOLS = [
         "function": {
             "name": "list_kev_catalog",
             "description": "List vulnerabilities that are in the CISA Known Exploited Vulnerabilities (KEV) catalog. Returns up to 20 entries.",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
+            "parameters": {"type": "object", "properties": {}}
         }
     }
 ]
 
 def execute_tool(tool_name: str, arguments: Dict) -> str:
-    """Execute the tool and return a string result."""
     if tool_name == "search_cves":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
@@ -268,10 +244,8 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
         results = search_nvd(keyword, datetime.now() - timedelta(days=365), datetime.now(), max_results)
         if not results:
             return f"No CVEs found for '{keyword}'."
-        # Return only essential fields to keep it concise
         simplified = [{"cve": r["cve"], "description": r["description"][:200]} for r in results]
         return json.dumps(simplified, indent=2)
-
     elif tool_name == "get_cve_details":
         cve_id = arguments["cve_id"]
         nvd = fetch_nvd_cve(cve_id)
@@ -290,49 +264,37 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
             "past_likelihood": past_likelihood
         }
         return json.dumps(result, indent=2)
-
     elif tool_name == "list_kev_catalog":
         kev_list = fetch_kev_catalog()
         if not kev_list:
             return "No KEV entries found."
-        # Return first 20 for brevity
         short_list = [{"cve": item.get("cveID"), "description": item.get("shortDescription", "")[:100]} for item in kev_list[:20]]
         return json.dumps(short_list, indent=2)
-
     else:
         return f"Unknown tool: {tool_name}"
 
-# ---------- LLM Agent Loop ----------
 def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[str, List[Dict]]:
-    """
-    Process a user message using the agent loop with native function calling.
-    Returns the final assistant answer and updated conversation history.
-    """
-    # Build messages list from conversation history
     messages = []
     messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
-    max_iterations = 5
-    iteration = 0
-
-    # System prompt to set the context (no need to describe tools manually)
     system_prompt = {
         "role": "system",
         "content": "You are a cybersecurity vulnerability analyst. You have access to tools to search for CVEs, get details, and list the CISA KEV catalog. Use them when necessary to answer user questions accurately. Be concise and helpful."
     }
-    # Insert system prompt at the beginning if not already present
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
 
+    max_iterations = 5
+    iteration = 0
     while iteration < max_iterations:
         client = groq.Groq(api_key=GROQ_API_KEY)
         try:
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
-                tools=TOOLS,                    # Pass the tool definitions
-                tool_choice="auto",             # Let the model decide
+                tools=TOOLS,
+                tool_choice="auto",
                 temperature=0.2,
                 max_tokens=1024,
             )
@@ -340,37 +302,25 @@ def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[st
         except Exception as e:
             return f"Error calling LLM: {e}", conversation_history
 
-        # If there are tool calls, execute them
         if assistant_message.tool_calls:
-            # Add the assistant's tool call message to the conversation
             messages.append(assistant_message)
-
-            # Process each tool call
             for tool_call in assistant_message.tool_calls:
                 tool_name = tool_call.function.name
                 arguments = json.loads(tool_call.function.arguments)
-
-                # Execute the tool
                 tool_result = execute_tool(tool_name, arguments)
-
-                # Append the tool result with the correct tool_call_id
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "content": tool_result,
                 })
-
             iteration += 1
-            continue  # loop again to let the model process the tool results
+            continue
+        else:
+            final_answer = assistant_message.content
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": final_answer})
+            return final_answer, conversation_history
 
-        # No tool calls – final answer
-        final_answer = assistant_message.content
-        # Update conversation history with the user message and final assistant answer
-        conversation_history.append({"role": "user", "content": user_message})
-        conversation_history.append({"role": "assistant", "content": final_answer})
-        return final_answer, conversation_history
-
-    # If we exit loop without final answer, return last message
     final_message = "I'm sorry, I couldn't resolve your request. Please try again."
     conversation_history.append({"role": "user", "content": user_message})
     conversation_history.append({"role": "assistant", "content": final_message})
@@ -381,7 +331,6 @@ def main():
     st.title("🛡️ Vulnerability Intelligence Dashboard")
     st.markdown("Aggregate **CVSS**, **EPSS**, **CISA KEV**, and compute **Past Likelihood (LEV)**. Powered by open‑source LLM (Groq).")
 
-    # Sidebar for mode selection
     mode = st.sidebar.radio("Select Mode", ["Single CVE Lookup", "Search & Dashboard", "AI Agent"])
 
     if mode == "Single CVE Lookup":
@@ -412,7 +361,6 @@ def main():
                             st.subheader("📝 Description")
                             st.write(nvd["description"])
 
-                        # Store data for chat agent if needed
                         st.session_state.last_data = {
                             "cve": cve_input,
                             "cvss": nvd["cvss_score"],
@@ -445,11 +393,9 @@ def main():
                         st.success(f"Found {len(cve_list)} CVEs. Enriching data...")
                         df = enrich_cve_data(cve_list)
 
-                        # Display interactive table
                         st.subheader("📋 Vulnerability List")
                         st.dataframe(df, use_container_width=True)
 
-                        # Visualizations
                         st.subheader("📈 Visualizations")
                         df_plot = df.copy()
                         df_plot["CVSS Score"] = pd.to_numeric(df_plot["CVSS Score"], errors="coerce")
@@ -482,34 +428,27 @@ def main():
                             col2.metric("Max CVSS Score", f"{df_plot['CVSS Score'].max():.2f}")
                             col3.metric("KEV Count", len(df[df["KEV"] == "Yes"]))
 
-                        # Store data for chat agent if needed
                         st.session_state.last_data = df
 
     elif mode == "AI Agent":
         st.header("🤖 AI Vulnerability Agent")
         st.markdown("Ask anything about vulnerabilities. The agent will fetch data from NVD, EPSS, and CISA KEV as needed.")
 
-        # Initialize conversation history in session state
         if "agent_messages" not in st.session_state:
-            st.session_state.agent_messages = []  # list of {"role": "user"/"assistant", "content": ...}
+            st.session_state.agent_messages = []
 
-        # Display chat history
         for msg in st.session_state.agent_messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-        # User input
         if prompt := st.chat_input("Ask a question..."):
-            # Add user message to UI
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            # Process with agent
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     answer, new_history = agent_query(prompt, st.session_state.agent_messages)
                     st.markdown(answer)
-                    # Update session state with the new history
                     st.session_state.agent_messages = new_history
 
 if __name__ == "__main__":
