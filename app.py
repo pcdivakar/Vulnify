@@ -163,7 +163,7 @@ def analyze_assets(df, column_map, lookback_months=24):
     debug_info = []  # (asset_name, query, results_count)
     for _, row in df.iterrows():
         terms = []
-        # Only use asset_name, asset_type, vendor, model (firmware removed)
+        # Use only asset_name, asset_type, vendor, model (no firmware)
         for field in ["asset_name", "asset_type", "vendor", "model"]:
             col = column_map.get(field)
             if col and pd.notna(row[col]) and str(row[col]).strip():
@@ -266,22 +266,6 @@ def hf_chat(prompt: str, context: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-def search_ics_advisories(keyword: str, max_results: int = 10) -> List[Dict]:
-    """Search ICS-CERT advisories for a keyword (very simple)."""
-    advisories = fetch_ics_advisories()
-    if not advisories:
-        return []
-    results = []
-    keyword_lower = keyword.lower()
-    for adv in advisories:
-        title = adv.get("title", "").lower()
-        description = adv.get("shortDescription", "").lower()
-        if keyword_lower in title or keyword_lower in description:
-            results.append(adv)
-            if len(results) >= max_results:
-                break
-    return results
-
 # ---------- Streamlit UI ----------
 def main():
     st.title("🛡️ OT Threat Intelligence")
@@ -335,9 +319,7 @@ def main():
                 with col2:
                     col_map["asset_type"] = st.selectbox("Asset Type (optional)", ["-- None --"] + cols, index=0)
                     col_map["model"] = st.selectbox("Model (optional)", ["-- None --"] + cols, index=0)
-                with col3:
-                    # Firmware mapping kept but will not be used in query
-                    col_map["firmware"] = st.selectbox("Firmware (optional, not used in search)", ["-- None --"] + cols, index=0)
+                # No firmware mapping
                 submit = st.form_submit_button("Analyze Assets")
 
             if submit:
@@ -362,10 +344,10 @@ def main():
                 with st.expander("🔍 Search Query Debug"):
                     for name, query, count in debug_info:
                         st.write(f"**{name}**: `{query}` → {count} results")
-                    st.caption("If a query returns zero results, try simplifying the query or increasing lookback.")
+                    st.caption("If a query returns zero results, try simplifying the query (use fewer terms) or increasing the lookback months.")
 
                 if df_vulns.empty:
-                    st.warning("No vulnerabilities found. Check the debug info.")
+                    st.warning("No vulnerabilities found. Check the debug info to see which queries returned zero results. You can also use the manual test search in the sidebar to experiment.")
                 else:
                     with st.spinner("Generating threat summary..."):
                         summary = generate_threat_summary(df_vulns, len(df))
@@ -374,37 +356,25 @@ def main():
 
                     # Dashboards
                     st.subheader("📈 Vulnerability Dashboard")
+                    # CVSS Distribution
                     fig1 = px.histogram(df_vulns, x="cvss_score", nbins=20, title="CVSS Score Distribution")
                     st.plotly_chart(fig1, use_container_width=True)
 
+                    # Risk level pie chart
                     df_vulns["risk_level"] = pd.cut(df_vulns["cvss_score"], bins=[0, 4, 7, 9, 10], labels=["Low", "Medium", "High", "Critical"])
                     risk_counts = df_vulns["risk_level"].value_counts().reset_index()
                     fig2 = px.pie(risk_counts, values="count", names="risk_level", title="Risk Level Distribution")
                     st.plotly_chart(fig2, use_container_width=True)
 
+                    # Top affected assets
                     top_assets = df_vulns["asset"].value_counts().head(10).reset_index()
                     fig3 = px.bar(top_assets, x="asset", y="count", title="Top 10 Affected Assets")
                     st.plotly_chart(fig3, use_container_width=True)
 
+                    # Table of top CVEs
                     st.subheader("Top 10 Critical CVEs")
                     top_cves = df_vulns.nlargest(10, "cvss_score")[["cve", "cvss_score", "epss", "kev", "description", "asset"]]
                     st.dataframe(top_cves)
-
-            # Optionally show ICS-CERT advisories related to the assets
-            if "asset_name" in col_map:
-                with st.expander("📢 ICS-CERT Advisories (first 10 per asset)"):
-                    # Get first asset name from the mapping
-                    sample_asset = df[col_map["asset_name"]].iloc[0] if not df.empty else None
-                    if sample_asset:
-                        advisories = search_ics_advisories(str(sample_asset), max_results=10)
-                        if advisories:
-                            st.write(f"Advisories related to '{sample_asset}':")
-                            for adv in advisories:
-                                st.markdown(f"**{adv.get('icsa')}**: {adv.get('title')} – [Link]({adv.get('url', '#')})")
-                        else:
-                            st.info(f"No ICS-CERT advisories found for '{sample_asset}'. Try a manual search later.")
-                    else:
-                        st.info("No asset name mapped to search ICS advisories.")
 
         except Exception as e:
             st.error(f"Error processing file: {e}")
