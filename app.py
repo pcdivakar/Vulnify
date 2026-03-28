@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import time
 import json
 import re
+import uuid
 import groq
 from typing import Dict, List, Optional, Tuple
 
@@ -253,7 +254,6 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
     if tool_name == "search_cves":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
-        # Ensure max_results is integer
         try:
             max_results = int(max_results)
         except:
@@ -298,86 +298,70 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
 # ---------- LLM Agent Loop ----------
 def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[str, List[Dict]]:
     """
-    Process a user message using the agent loop.
+    Process a user message using the agent loop with native function calling.
     Returns the final assistant answer and updated conversation history.
     """
-    # System prompt with tool definitions
-    system_prompt = """You are a cybersecurity vulnerability analyst. You have access to the following tools:
-
-<tools>
-{
-  "name": "search_cves",
-  "description": "Search for vulnerabilities by keyword. Returns a list of CVE IDs and brief info.",
-  "parameters": {
-    "keyword": "string (required)",
-    "max_results": "integer (optional, default 10)"
-  }
-}
-{
-  "name": "get_cve_details",
-  "description": "Get full details of a specific CVE including CVSS score, description, EPSS probability, KEV status, and past likelihood.",
-  "parameters": {
-    "cve_id": "string (required)"
-  }
-}
-{
-  "name": "list_kev_catalog",
-  "description": "List vulnerabilities that are in the CISA Known Exploited Vulnerabilities (KEV) catalog. Returns up to 20 entries.",
-  "parameters": {}
-}
-</tools>
-
-When you need to use a tool, respond with a JSON object in the following format:
-{"tool": "<tool_name>", "arguments": {"param1": "value1", ...}}
-
-If you have enough information to answer the user, respond with a plain text answer (no JSON). Do not add any extra text outside the JSON when using a tool.
-
-Think step by step. Use tools only when necessary. Be concise but thorough.
-"""
-
-    # Build messages list
-    messages = [{"role": "system", "content": system_prompt}]
+    # Build messages list from conversation history
+    messages = []
     messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
     max_iterations = 5
     iteration = 0
 
+    # System prompt to set the context (no need to describe tools manually)
+    system_prompt = {
+        "role": "system",
+        "content": "You are a cybersecurity vulnerability analyst. You have access to tools to search for CVEs, get details, and list the CISA KEV catalog. Use them when necessary to answer user questions accurately. Be concise and helpful."
+    }
+    # Insert system prompt at the beginning if not already present
+    if not messages or messages[0].get("role") != "system":
+        messages.insert(0, system_prompt)
+
     while iteration < max_iterations:
-        # Call Groq – using stable production model (llama-3.3-70b-versatile)
         client = groq.Groq(api_key=GROQ_API_KEY)
         try:
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",   # Production model
+                model="llama-3.3-70b-versatile",
                 messages=messages,
+                tools=TOOLS,                    # Pass the tool definitions
+                tool_choice="auto",             # Let the model decide
                 temperature=0.2,
                 max_tokens=1024,
             )
-            assistant_message = response.choices[0].message.content
+            assistant_message = response.choices[0].message
         except Exception as e:
             return f"Error calling LLM: {e}", conversation_history
 
-        # Try to parse as JSON tool call
-        try:
-            parsed = json.loads(assistant_message)
-            if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
-                tool_name = parsed["tool"]
-                arguments = parsed["arguments"]
+        # If there are tool calls, execute them
+        if assistant_message.tool_calls:
+            # Add the assistant's tool call message to the conversation
+            messages.append(assistant_message)
+
+            # Process each tool call
+            for tool_call in assistant_message.tool_calls:
+                tool_name = tool_call.function.name
+                arguments = json.loads(tool_call.function.arguments)
+
                 # Execute the tool
                 tool_result = execute_tool(tool_name, arguments)
-                # Add tool call and result to messages
-                messages.append({"role": "assistant", "content": assistant_message})
-                messages.append({"role": "tool", "content": tool_result})
-                iteration += 1
-                continue  # loop again
-        except json.JSONDecodeError:
-            pass
 
-        # Not a tool call -> final answer
-        # Append final answer to conversation history
+                # Append the tool result with the correct tool_call_id
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result,
+                })
+
+            iteration += 1
+            continue  # loop again to let the model process the tool results
+
+        # No tool calls – final answer
+        final_answer = assistant_message.content
+        # Update conversation history with the user message and final assistant answer
         conversation_history.append({"role": "user", "content": user_message})
-        conversation_history.append({"role": "assistant", "content": assistant_message})
-        return assistant_message, conversation_history
+        conversation_history.append({"role": "assistant", "content": final_answer})
+        return final_answer, conversation_history
 
     # If we exit loop without final answer, return last message
     final_message = "I'm sorry, I couldn't resolve your request. Please try again."
