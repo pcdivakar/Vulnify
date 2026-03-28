@@ -17,7 +17,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------- Load Secrets (optional) ----------
+# ---------- Load Secrets ----------
 try:
     NVD_API_KEY = st.secrets.get("NVD_API_KEY", None)
 except:
@@ -29,14 +29,14 @@ except:
     GROQ_API_KEY = None
     st.warning("Groq API key not found. LLM features will be disabled.")
 
-# ---------- API Key Status in Sidebar ----------
+# ---------- API Key Status ----------
 with st.sidebar:
     if NVD_API_KEY:
         st.success("✅ NVD API key loaded")
     else:
-        st.info("ℹ️ No NVD API key – using public rate limits (5 req/30 sec).")
+        st.info("ℹ️ No NVD API key – using public rate limits.")
     if not GROQ_API_KEY:
-        st.error("❌ Groq API key required for AI Agent. Add it in Secrets.")
+        st.error("❌ Groq API key required for AI Agent.")
 
 # ---------- Cached API Functions ----------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -117,6 +117,7 @@ def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_results: int = 50) -> List[Dict]:
+    """Basic NVD keyword search (returns only CVE ID and description)."""
     max_results = int(max_results)
     results = []
     start_index = 0
@@ -150,7 +151,7 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
                 start_index += len(vulns)
                 if start_index >= total:
                     break
-                time.sleep(0.2)  # Avoid hitting rate limits
+                time.sleep(0.2)  # avoid rate limits
             elif resp.status_code == 404:
                 st.warning(f"NVD search returned 404 – no results for '{keyword}'.")
                 break
@@ -162,48 +163,41 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
             break
     return results[:max_results]
 
-def enrich_cve_data(cve_list: List[Dict]) -> pd.DataFrame:
-    kev_list = fetch_kev_catalog()
-    enriched = []
-    for cve_info in cve_list:
-        cve_id = cve_info["cve"]
-        with st.spinner(f"Fetching {cve_id}..."):
-            nvd = fetch_nvd_cve(cve_id)
-            if nvd:
-                epss = fetch_epss(cve_id)
-                in_kev = is_in_kev(cve_id, kev_list)
-                past_likelihood = get_past_likelihood(nvd["exploitability_score"], in_kev)
-                enriched.append({
-                    "CVE": cve_id,
-                    "CVSS Score": nvd["cvss_score"],
-                    "EPSS Probability": epss if epss is not None else "N/A",
-                    "KEV": "Yes" if in_kev else "No",
-                    "Past Likelihood (LEV)": past_likelihood,
-                    "Description": nvd["description"][:200] + "..." if len(nvd["description"]) > 200 else nvd["description"],
-                })
-            else:
-                enriched.append({
-                    "CVE": cve_id,
-                    "CVSS Score": "N/A",
-                    "EPSS Probability": "N/A",
-                    "KEV": "No",
-                    "Past Likelihood (LEV)": "Unknown",
-                    "Description": "Not found in NVD",
-                })
-    return pd.DataFrame(enriched)
+def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
+    """Fetch and enrich a single CVE with EPSS, KEV, and past likelihood."""
+    nvd = fetch_nvd_cve(cve_id)
+    if not nvd:
+        return None
+    epss = fetch_epss(cve_id)
+    in_kev = is_in_kev(cve_id, kev_list)
+    past_likelihood = get_past_likelihood(nvd["exploitability_score"], in_kev)
+    return {
+        "cve": cve_id,
+        "cvss_score": nvd["cvss_score"],
+        "epss": epss,
+        "kev": in_kev,
+        "past_likelihood": past_likelihood,
+        "description": nvd["description"]
+    }
 
 # ---------- LLM Agent Tools ----------
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_cves",
-            "description": "Search for vulnerabilities by keyword. Returns a list of CVE IDs and brief info.",
+            "name": "search_vulnerabilities",
+            "description": "Search for vulnerabilities by keyword and return fully enriched data including CVSS score, EPSS probability, KEV status, and past likelihood. This is the primary tool for answering general questions about vulnerabilities.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string", "description": "The search term (e.g., 'Apache', 'RCE')."},
-                    "max_results": {"type": "integer", "description": "Maximum number of CVEs to return (default 10)."}
+                    "keyword": {
+                        "type": "string",
+                        "description": "The search term (e.g., 'Cisco', 'Apache', 'RCE')."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of CVEs to return (default 10)."
+                    }
                 },
                 "required": ["keyword"]
             }
@@ -217,7 +211,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cve_id": {"type": "string", "description": "The CVE ID, e.g., 'CVE-2023-12345'."}
+                    "cve_id": {
+                        "type": "string",
+                        "description": "The CVE ID, e.g., 'CVE-2023-12345'."
+                    }
                 },
                 "required": ["cve_id"]
             }
@@ -228,51 +225,64 @@ TOOLS = [
         "function": {
             "name": "list_kev_catalog",
             "description": "List vulnerabilities that are in the CISA Known Exploited Vulnerabilities (KEV) catalog. Returns up to 20 entries.",
-            "parameters": {"type": "object", "properties": {}}
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
         }
     }
 ]
 
 def execute_tool(tool_name: str, arguments: Dict) -> str:
-    if tool_name == "search_cves":
+    """Execute the tool and return a string result."""
+    if tool_name == "search_vulnerabilities":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
         try:
             max_results = int(max_results)
         except:
             max_results = 10
-        results = search_nvd(keyword, datetime.now() - timedelta(days=365), datetime.now(), max_results)
-        if not results:
-            return f"No CVEs found for '{keyword}'."
-        simplified = [{"cve": r["cve"], "description": r["description"][:200]} for r in results]
-        return json.dumps(simplified, indent=2)
+
+        # First, get basic list from NVD (last year)
+        basic_results = search_nvd(keyword, datetime.now() - timedelta(days=365), datetime.now(), max_results)
+        if not basic_results:
+            return f"No vulnerabilities found for '{keyword}'."
+
+        # Fetch KEV catalog once
+        kev_list = fetch_kev_catalog()
+
+        enriched = []
+        for item in basic_results[:max_results]:
+            cve_id = item["cve"]
+            enriched_item = enrich_cve(cve_id, kev_list)
+            if enriched_item:
+                enriched.append(enriched_item)
+
+        if not enriched:
+            return f"Could not enrich any CVEs for '{keyword}'."
+
+        # Return as JSON
+        return json.dumps(enriched, indent=2)
+
     elif tool_name == "get_cve_details":
         cve_id = arguments["cve_id"]
-        nvd = fetch_nvd_cve(cve_id)
-        if not nvd:
-            return f"CVE {cve_id} not found."
-        epss = fetch_epss(cve_id)
         kev_list = fetch_kev_catalog()
-        in_kev = is_in_kev(cve_id, kev_list)
-        past_likelihood = get_past_likelihood(nvd["exploitability_score"], in_kev)
-        result = {
-            "cve": cve_id,
-            "cvss_score": nvd["cvss_score"],
-            "description": nvd["description"],
-            "epss": epss,
-            "kev": in_kev,
-            "past_likelihood": past_likelihood
-        }
-        return json.dumps(result, indent=2)
+        enriched = enrich_cve(cve_id, kev_list)
+        if not enriched:
+            return f"CVE {cve_id} not found."
+        return json.dumps(enriched, indent=2)
+
     elif tool_name == "list_kev_catalog":
         kev_list = fetch_kev_catalog()
         if not kev_list:
             return "No KEV entries found."
         short_list = [{"cve": item.get("cveID"), "description": item.get("shortDescription", "")[:100]} for item in kev_list[:20]]
         return json.dumps(short_list, indent=2)
+
     else:
         return f"Unknown tool: {tool_name}"
 
+# ---------- LLM Agent Loop ----------
 def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[str, List[Dict]]:
     messages = []
     messages.extend(conversation_history)
@@ -280,13 +290,22 @@ def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[st
 
     system_prompt = {
         "role": "system",
-        "content": "You are a cybersecurity vulnerability analyst. You have access to tools to search for CVEs, get details, and list the CISA KEV catalog. Use them when necessary to answer user questions accurately. Be concise and helpful."
+        "content": """You are a cybersecurity vulnerability analyst. You have access to the following tools:
+
+- search_vulnerabilities: Use this to search for vulnerabilities by keyword (e.g., "Cisco switches"). It returns a list of CVEs with CVSS scores, EPSS probabilities, KEV status, and past likelihood. This is your primary tool for answering general questions.
+
+- get_cve_details: Use this when you need detailed information about a specific CVE ID.
+
+- list_kev_catalog: Use this to list all CVEs in the CISA KEV catalog.
+
+When answering a question, use the appropriate tool(s) to gather data. If the user asks for a summary or analysis, first retrieve the data, then provide a concise, prioritized summary highlighting the most critical vulnerabilities (e.g., those with high CVSS, high EPSS, or in KEV). Be helpful and actionable."""
     }
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
 
-    max_iterations = 5
+    max_iterations = 10  # allow deeper reasoning if needed
     iteration = 0
+
     while iteration < max_iterations:
         client = groq.Groq(api_key=GROQ_API_KEY)
         try:
@@ -361,15 +380,6 @@ def main():
                             st.subheader("📝 Description")
                             st.write(nvd["description"])
 
-                        st.session_state.last_data = {
-                            "cve": cve_input,
-                            "cvss": nvd["cvss_score"],
-                            "epss": epss,
-                            "kev": in_kev,
-                            "lev": past_likelihood,
-                            "desc": nvd["description"]
-                        }
-
     elif mode == "Search & Dashboard":
         st.header("🔎 Search & Dashboard")
         col1, col2, col3 = st.columns(3)
@@ -391,44 +401,37 @@ def main():
                         st.info("No vulnerabilities found for the given criteria.")
                     else:
                         st.success(f"Found {len(cve_list)} CVEs. Enriching data...")
-                        df = enrich_cve_data(cve_list)
+                        kev_list = fetch_kev_catalog()
+                        enriched = []
+                        for item in cve_list:
+                            enriched_item = enrich_cve(item["cve"], kev_list)
+                            if enriched_item:
+                                enriched.append(enriched_item)
+                        df = pd.DataFrame(enriched)
 
                         st.subheader("📋 Vulnerability List")
                         st.dataframe(df, use_container_width=True)
 
                         st.subheader("📈 Visualizations")
                         df_plot = df.copy()
-                        df_plot["CVSS Score"] = pd.to_numeric(df_plot["CVSS Score"], errors="coerce")
-                        df_plot["EPSS Probability"] = pd.to_numeric(df_plot["EPSS Probability"], errors="coerce")
-                        df_plot = df_plot.dropna(subset=["CVSS Score"])
+                        df_plot["cvss_score"] = pd.to_numeric(df_plot["cvss_score"], errors="coerce")
+                        df_plot = df_plot.dropna(subset=["cvss_score"])
 
                         if not df_plot.empty:
                             fig1 = px.bar(
-                                df_plot, x="CVE", y="CVSS Score",
-                                color="Past Likelihood (LEV)",
+                                df_plot, x="cve", y="cvss_score",
+                                color="past_likelihood",
                                 title="CVSS Scores by Vulnerability",
-                                labels={"CVSS Score": "CVSS v3 Score"},
+                                labels={"cvss_score": "CVSS v3 Score", "cve": "CVE"},
                                 height=500,
                             )
                             st.plotly_chart(fig1, use_container_width=True)
 
-                            df_scatter = df_plot.dropna(subset=["EPSS Probability"])
-                            if not df_scatter.empty:
-                                fig2 = px.scatter(
-                                    df_scatter, x="CVSS Score", y="EPSS Probability",
-                                    hover_name="CVE", color="Past Likelihood (LEV)",
-                                    title="Risk Matrix: CVSS vs EPSS",
-                                    labels={"CVSS Score": "CVSS v3 Score", "EPSS Probability": "EPSS (Exploit Probability)"},
-                                )
-                                st.plotly_chart(fig2, use_container_width=True)
-
                             st.subheader("📊 Summary Statistics")
                             col1, col2, col3 = st.columns(3)
-                            col1.metric("Avg CVSS Score", f"{df_plot['CVSS Score'].mean():.2f}")
-                            col2.metric("Max CVSS Score", f"{df_plot['CVSS Score'].max():.2f}")
-                            col3.metric("KEV Count", len(df[df["KEV"] == "Yes"]))
-
-                        st.session_state.last_data = df
+                            col1.metric("Avg CVSS Score", f"{df_plot['cvss_score'].mean():.2f}")
+                            col2.metric("Max CVSS Score", f"{df_plot['cvss_score'].max():.2f}")
+                            col3.metric("KEV Count", len(df[df["kev"] == True]))
 
     elif mode == "AI Agent":
         st.header("🤖 AI Vulnerability Agent")
