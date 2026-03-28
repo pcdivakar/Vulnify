@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import networkx as nx
 import requests
 from datetime import datetime, timedelta
 import time
@@ -14,8 +16,6 @@ import string
 import hashlib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import io
-import base64
 from typing import Dict, List, Optional, Tuple
 
 # ---------- Page Configuration ----------
@@ -49,7 +49,6 @@ except:
 # ---------- Custom CSS for Corporate Light Theme ----------
 st.markdown("""
 <style>
-    /* Global styles */
     .stApp {
         background-color: #f5f7fb;
     }
@@ -119,17 +118,6 @@ st.markdown("""
         overflow: hidden;
         border: 1px solid #e5e7eb;
     }
-    .css-1d391kg {
-        background-color: white;
-        border-radius: 12px;
-        padding: 1rem;
-        margin-bottom: 1rem;
-        border: 1px solid #e5e7eb;
-    }
-    hr {
-        margin: 1rem 0;
-        border-color: #e5e7eb;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -157,6 +145,27 @@ def init_db():
                   cve_id TEXT,
                   sent_at TIMESTAMP,
                   status TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS connections
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  email TEXT,
+                  source_asset_id INTEGER,
+                  target_asset_id INTEGER,
+                  relationship_type TEXT,
+                  created_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS asset_types
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  email TEXT,
+                  type_name TEXT,
+                  is_default INTEGER,
+                  created_at TIMESTAMP)''')
+    conn.commit()
+    # Pre‑populate default asset types if not already present
+    default_types = ["PLC", "RTU", "HMI", "SCADA", "Gateway", "IED", "VFD", "UPS", "Historian", "Engineering Workstation"]
+    for dt in default_types:
+        c.execute("SELECT id FROM asset_types WHERE email IS NULL AND type_name=? AND is_default=1", (dt,))
+        if not c.fetchone():
+            c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (NULL, ?, 1, ?)",
+                      (dt, datetime.now()))
     conn.commit()
     conn.close()
 
@@ -184,9 +193,6 @@ def send_email(to_email, subject, body):
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
-
-def generate_otp():
-    return ''.join(random.choices(string.digits, k=6))
 
 def safe_float(x):
     try:
@@ -247,6 +253,45 @@ def logout():
     st.session_state.user_email = None
     st.rerun()
 
+# ---------- Asset Type Management ----------
+def get_asset_types(email):
+    """Return list of available asset types (default + user's custom)."""
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    # Get default types (email IS NULL and is_default=1)
+    c.execute("SELECT type_name FROM asset_types WHERE email IS NULL AND is_default=1 ORDER BY type_name")
+    defaults = [row[0] for row in c.fetchall()]
+    # Get user's custom types
+    c.execute("SELECT type_name FROM asset_types WHERE email=? AND is_default=0 ORDER BY type_name", (email,))
+    customs = [row[0] for row in c.fetchall()]
+    conn.close()
+    return defaults + customs
+
+def add_asset_type(email, type_name):
+    """Add a custom asset type for the user."""
+    if not type_name.strip():
+        return False
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    # Check if already exists (default or user's)
+    c.execute("SELECT id FROM asset_types WHERE (email IS NULL OR email=?) AND type_name=?", (email, type_name))
+    if c.fetchone():
+        conn.close()
+        return False
+    c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (?, ?, 0, ?)",
+              (email, type_name, datetime.now()))
+    conn.commit()
+    conn.close()
+    return True
+
+def delete_asset_type(email, type_name):
+    """Delete a custom asset type (only allowed for user's own types, not defaults)."""
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM asset_types WHERE email=? AND type_name=? AND is_default=0", (email, type_name))
+    conn.commit()
+    conn.close()
+
 # ---------- Asset Management ----------
 def add_asset(email, asset_name, asset_type, location):
     conn = sqlite3.connect('ot_platform.db')
@@ -270,6 +315,56 @@ def delete_asset(asset_id):
     c.execute("DELETE FROM assets WHERE id=?", (asset_id,))
     conn.commit()
     conn.close()
+
+def get_asset_by_id(asset_id):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT id, asset_name, asset_type, location FROM assets WHERE id=?", (asset_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+# ---------- Connection Management ----------
+def add_connection(email, source_id, target_id, rel_type):
+    if source_id == target_id:
+        return False
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT id FROM connections WHERE email=? AND source_asset_id=? AND target_asset_id=?",
+              (email, source_id, target_id))
+    if c.fetchone():
+        conn.close()
+        return False
+    c.execute("INSERT INTO connections (email, source_asset_id, target_asset_id, relationship_type, created_at) VALUES (?, ?, ?, ?, ?)",
+              (email, source_id, target_id, rel_type, datetime.now()))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_connections(email):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT id, source_asset_id, target_asset_id, relationship_type FROM connections WHERE email=?", (email,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def delete_connection(conn_id):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM connections WHERE id=?", (conn_id,))
+    conn.commit()
+    conn.close()
+
+def build_network_graph(email):
+    G = nx.DiGraph()
+    assets = get_user_assets(email)
+    for asset_id, name, typ, loc, _ in assets:
+        G.add_node(asset_id, name=name, type=typ, location=loc)
+    connections = get_connections(email)
+    for conn_id, src, tgt, rel_type in connections:
+        G.add_edge(src, tgt, relationship=rel_type)
+    return G
 
 # ---------- Vulnerability Analysis Functions ----------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -321,17 +416,6 @@ def fetch_kev_catalog() -> List[Dict]:
         pass
     return []
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_ics_advisories() -> List[Dict]:
-    url = "https://www.cisa.gov/sites/default/files/feeds/ics-advisories.json"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("advisories", [])
-    except Exception:
-        pass
-    return []
-
 def is_in_kev(cve_id: str, kev_list: List[Dict]) -> bool:
     for item in kev_list:
         if item.get("cveID") == cve_id:
@@ -359,7 +443,6 @@ def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Op
     max_results = int(max_results)
     results = []
     start_index = 0
-    # Enhance OT context
     ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
     if any(term in keyword.lower() for term in ot_terms):
         keyword += " ics"
@@ -425,6 +508,17 @@ def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
         "past_likelihood": past_likelihood,
         "description": nvd["description"]
     }
+
+def get_vulnerabilities_for_asset(asset_name, max_results=10):
+    kev_list = fetch_kev_catalog()
+    cve_list = search_nvd(asset_name, max_results=max_results)
+    enriched = []
+    for item in cve_list:
+        enriched_item = enrich_cve(item["cve"], kev_list)
+        if enriched_item:
+            enriched_item["asset"] = asset_name
+            enriched.append(enriched_item)
+    return enriched
 
 # ---------- Alert Check ----------
 def check_new_alerts(user_email):
@@ -528,7 +622,6 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
     if tool_name == "search_vulnerabilities":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
-        # Convert to int in case LLM sends string
         try:
             max_results = int(max_results)
         except:
@@ -571,7 +664,7 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
     else:
         return f"Unknown tool: {tool_name}"
 
-def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[str, List[Dict]]:
+def agent_query(user_message: str, conversation_history: List[Dict], network_context: str = "") -> Tuple[str, List[Dict]]:
     if not GROQ_API_KEY:
         return "Groq API key not configured. AI Agent disabled.", conversation_history
 
@@ -581,7 +674,13 @@ def agent_query(user_message: str, conversation_history: List[Dict]) -> Tuple[st
 
     system_prompt = {
         "role": "system",
-        "content": "You are an OT/ICS cybersecurity analyst. Use tools to gather data. When using tools, ensure numeric parameters are integers (no quotes). Consider OT/ICS implications in your answers."
+        "content": f"""You are an OT/ICS cybersecurity analyst. You have access to tools to search for CVEs, get details, list KEV, and get ICS advisories.
+If the user asks about a specific asset, use the network architecture information provided below to understand upstream/downstream dependencies and predict impact propagation.
+
+Network Architecture:
+{network_context}
+
+When using tools, ensure numeric parameters are integers (no quotes). Consider OT/ICS implications and network dependencies in your answers."""
     }
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
@@ -667,6 +766,93 @@ def analyze_assets(user_email):
     }
     return df, stats
 
+def get_asset_epss_summary(user_email, df):
+    """Return DataFrame with per‑asset EPSS statistics."""
+    if df.empty:
+        return pd.DataFrame()
+    agg = df.groupby("asset").agg(
+        max_epss=("epss", "max"),
+        avg_epss=("epss", "mean"),
+        high_risk_count=("epss", lambda x: (x > 0.5).sum())
+    ).reset_index()
+    agg["risk_level"] = agg["max_epss"].apply(
+        lambda x: "Very High" if x > 0.8 else ("High" if x > 0.5 else ("Medium" if x > 0.2 else "Low"))
+    )
+    return agg.sort_values("max_epss", ascending=False)
+
+def get_latest_cves_for_assets(user_email, limit=5):
+    assets = get_user_assets(user_email)
+    if not assets:
+        return []
+    kev_list = fetch_kev_catalog()
+    all_cves = []
+    for asset_id, asset_name, asset_type, location, _ in assets:
+        cve_list = search_nvd(asset_name, max_results=5)
+        for item in cve_list:
+            enriched = enrich_cve(item["cve"], kev_list)
+            if enriched:
+                enriched["asset"] = asset_name
+                all_cves.append(enriched)
+    all_cves.sort(key=lambda x: safe_float(x.get("cvss_score", 0)), reverse=True)
+    return all_cves[:limit]
+
+# ---------- Network Graph Visualization ----------
+def plot_network_graph(email):
+    G = build_network_graph(email)
+    if G.number_of_nodes() == 0:
+        return None
+
+    pos = nx.spring_layout(G, k=1, iterations=50, seed=42)
+
+    edge_x = []
+    edge_y = []
+    for edge in G.edges():
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+
+    edge_trace = go.Scatter(
+        x=edge_x, y=edge_y,
+        line=dict(width=1, color='#888'),
+        hoverinfo='none',
+        mode='lines')
+
+    node_x = []
+    node_y = []
+    node_text = []
+    for node in G.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+        node_data = G.nodes[node]
+        node_text.append(f"<b>{node_data['name']}</b><br>Type: {node_data['type']}<br>Location: {node_data['location']}")
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode='markers+text',
+        text=node_text,
+        textposition="top center",
+        hoverinfo='text',
+        marker=dict(
+            size=30,
+            color='#3b82f6',
+            line=dict(width=2, color='white')
+        )
+    )
+
+    fig = go.Figure(data=[edge_trace, node_trace],
+                    layout=go.Layout(
+                        title='Network Architecture',
+                        titlefont_size=16,
+                        showlegend=False,
+                        hovermode='closest',
+                        margin=dict(b=20, l=5, r=5, t=40),
+                        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
+                    )
+    return fig
+
 # ---------- Main App ----------
 def main():
     if "logged_in" not in st.session_state or not st.session_state.logged_in:
@@ -678,7 +864,7 @@ def main():
     # Sidebar
     with st.sidebar:
         st.markdown("### 🏭 Navigation")
-        page = st.radio("", ["Dashboard", "Asset Manager", "AI Agent"])
+        page = st.radio("", ["Dashboard", "Asset Manager", "Network Architecture", "AI Agent"])
         st.markdown("---")
         st.markdown(f"**Logged in as**  \n{user_email}")
         if st.button("Logout"):
@@ -687,14 +873,12 @@ def main():
     if page == "Dashboard":
         st.markdown('<div class="main-header">📊 OT Vulnerability Dashboard</div>', unsafe_allow_html=True)
 
-        # On login, automatically check for new alerts (once per session)
         if "alert_checked" not in st.session_state:
             with st.spinner("Checking for new vulnerabilities..."):
                 _, msg = check_new_alerts(user_email)
                 st.info(msg)
                 st.session_state.alert_checked = True
 
-        # Manual check button
         col1, col2 = st.columns([1, 5])
         with col1:
             if st.button("🔄 Check for New Alerts"):
@@ -745,6 +929,46 @@ def main():
                       x="asset", y="count", title="")
         st.plotly_chart(fig3, use_container_width=True)
 
+        # ---------- EPSS Proactive Analysis ----------
+        asset_epss = get_asset_epss_summary(user_email, df)
+        if not asset_epss.empty:
+            st.subheader("🚨 Assets with Highest Exploitation Probability (EPSS)")
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                fig_epss = px.bar(asset_epss.head(10), x="asset", y="max_epss",
+                                  color="risk_level",
+                                  color_discrete_map={"Very High": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"},
+                                  title="Top 10 Assets by Max EPSS Score",
+                                  labels={"max_epss": "EPSS Score (0-1)", "asset": "Asset"})
+                st.plotly_chart(fig_epss, use_container_width=True)
+            with col2:
+                st.markdown("**Why these assets are high risk:**")
+                if st.button("Generate AI Explanation", key="epss_btn"):
+                    top_assets = asset_epss.head(5)["asset"].tolist()
+                    vuln_data = df[df["asset"].isin(top_assets)][["asset", "cve", "epss", "description"]].head(20)
+                    prompt = f"""
+You are an OT cybersecurity analyst. Explain why the following assets are at high risk of exploitation in the next 30 days based on their EPSS scores. Provide a concise, actionable summary for the security team.
+
+Assets and their top vulnerabilities (EPSS > 0.5):
+{vuln_data.to_string()}
+"""
+                    with st.spinner("Generating explanation..."):
+                        explanation, _ = agent_query(prompt, [], "")
+                        st.write(explanation)
+
+        # Latest relevant CVEs
+        st.subheader("Latest Relevant CVEs for Your Assets")
+        latest_cves = get_latest_cves_for_assets(user_email, limit=10)
+        if latest_cves:
+            latest_df = pd.DataFrame(latest_cves)
+            latest_df = latest_df[["asset", "cve", "cvss_score", "epss", "kev", "description"]]
+            latest_df["cvss_score"] = latest_df["cvss_score"].round(1)
+            latest_df["epss"] = latest_df["epss"].round(4)
+            latest_df["kev"] = latest_df["kev"].apply(lambda x: "Yes" if x else "No")
+            st.dataframe(latest_df, use_container_width=True)
+        else:
+            st.info("No CVEs found for your assets.")
+
         # Detailed table
         st.subheader("Detailed Vulnerability List")
         display_df = df[["asset", "cve", "cvss_score", "epss", "risk", "description"]].copy()
@@ -754,14 +978,45 @@ def main():
 
     elif page == "Asset Manager":
         st.markdown('<div class="main-header">📦 Asset Manager</div>', unsafe_allow_html=True)
-        st.markdown("Manage your OT assets – add manually or import from Excel/CSV.")
+        st.markdown("Manage your OT assets and asset types.")
 
+        # Asset type management
+        with st.expander("🏷️ Manage Asset Types"):
+            st.markdown("Add new asset types or delete custom ones (default types cannot be deleted).")
+            col1, col2 = st.columns(2)
+            with col1:
+                new_type = st.text_input("New Asset Type")
+                if st.button("Add Type"):
+                    if new_type:
+                        if add_asset_type(user_email, new_type):
+                            st.success(f"Added type '{new_type}'")
+                            st.rerun()
+                        else:
+                            st.warning("Type already exists.")
+                    else:
+                        st.warning("Enter a type name.")
+            with col2:
+                conn = sqlite3.connect('ot_platform.db')
+                c = conn.cursor()
+                c.execute("SELECT type_name FROM asset_types WHERE email=? AND is_default=0 ORDER BY type_name", (user_email,))
+                custom_types = [row[0] for row in c.fetchall()]
+                conn.close()
+                if custom_types:
+                    type_to_delete = st.selectbox("Select custom type to delete", custom_types)
+                    if st.button("Delete Type"):
+                        delete_asset_type(user_email, type_to_delete)
+                        st.success(f"Deleted type '{type_to_delete}'")
+                        st.rerun()
+                else:
+                    st.info("No custom types added yet.")
+
+        # Add asset manually
         with st.expander("➕ Add Asset Manually"):
             col1, col2, col3 = st.columns(3)
             with col1:
                 asset_name = st.text_input("Asset Name")
             with col2:
-                asset_type = st.selectbox("Asset Type", ["PLC", "RTU", "HMI", "SCADA", "Gateway", "Other"])
+                asset_type = st.selectbox("Asset Type", get_asset_types(user_email))
             with col3:
                 location = st.text_input("Location (optional)")
             if st.button("Add Asset"):
@@ -772,6 +1027,7 @@ def main():
                 else:
                     st.warning("Please enter an asset name.")
 
+        # Import from Excel/CSV
         with st.expander("📎 Import from Excel/CSV"):
             uploaded_file = st.file_uploader("Choose file", type=["xlsx", "csv"])
             if uploaded_file:
@@ -780,10 +1036,13 @@ def main():
                         df = pd.read_csv(uploaded_file)
                     else:
                         df = pd.read_excel(uploaded_file)
+                    type_list = get_asset_types(user_email)
                     for idx, row in df.iterrows():
                         name = str(row.iloc[0]).strip()
                         if name and name != "nan":
                             asset_type = str(row.iloc[1]) if len(row) > 1 else "Other"
+                            if asset_type not in type_list:
+                                add_asset_type(user_email, asset_type)
                             location = str(row.iloc[2]) if len(row) > 2 else ""
                             add_asset(user_email, name, asset_type, location)
                     st.success(f"Imported {len(df)} assets.")
@@ -791,6 +1050,7 @@ def main():
                 except Exception as e:
                     st.error(f"Error reading file: {e}")
 
+        # List current assets
         st.subheader("Your Assets")
         assets = get_user_assets(user_email)
         if not assets:
@@ -806,13 +1066,102 @@ def main():
                     delete_asset(asset_id)
                     st.rerun()
 
+    elif page == "Network Architecture":
+        st.markdown('<div class="main-header">🔗 Network Architecture</div>', unsafe_allow_html=True)
+        st.markdown("Define connections between your OT assets to model upstream/downstream dependencies. The AI agent will use this to predict impact propagation.")
+
+        assets = get_user_assets(user_email)
+        if not assets:
+            st.warning("Please add assets first in the Asset Manager.")
+        else:
+            # Add connection
+            with st.expander("➕ Add Connection"):
+                col1, col2, col3 = st.columns(3)
+                asset_names = [f"{a[1]} (ID:{a[0]})" for a in assets]
+                asset_ids = {f"{name} (ID:{aid})": aid for aid, name, _, _, _ in assets}
+                with col1:
+                    source = st.selectbox("Source Asset", asset_names)
+                with col2:
+                    target = st.selectbox("Target Asset", asset_names)
+                with col3:
+                    rel_type = st.selectbox("Relationship", ["upstream", "downstream", "peer"])
+                if st.button("Add Connection"):
+                    src_id = asset_ids[source]
+                    tgt_id = asset_ids[target]
+                    if src_id == tgt_id:
+                        st.warning("Source and target cannot be the same.")
+                    else:
+                        success = add_connection(user_email, src_id, tgt_id, rel_type)
+                        if success:
+                            st.success("Connection added.")
+                            st.rerun()
+                        else:
+                            st.warning("Connection already exists.")
+
+            # List existing connections
+            connections = get_connections(user_email)
+            if connections:
+                st.subheader("Existing Connections")
+                conn_data = []
+                for conn_id, src_id, tgt_id, rel_type in connections:
+                    src_name = get_asset_by_id(src_id)[1] if get_asset_by_id(src_id) else "Unknown"
+                    tgt_name = get_asset_by_id(tgt_id)[1] if get_asset_by_id(tgt_id) else "Unknown"
+                    conn_data.append({"ID": conn_id, "Source": src_name, "Target": tgt_name, "Type": rel_type})
+                conn_df = pd.DataFrame(conn_data)
+                st.dataframe(conn_df, use_container_width=True)
+
+                del_id = st.number_input("Connection ID to delete", min_value=0, step=1)
+                if st.button("Delete Connection") and del_id > 0:
+                    delete_connection(del_id)
+                    st.success("Connection deleted.")
+                    st.rerun()
+            else:
+                st.info("No connections yet. Add some to model your network.")
+
+            # Visualize network
+            st.subheader("Network Graph")
+            fig = plot_network_graph(user_email)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Not enough nodes to display graph (need at least one asset).")
+
     elif page == "AI Agent":
         st.markdown('<div class="main-header">🤖 OT Vulnerability Agent</div>', unsafe_allow_html=True)
-        st.markdown("Ask any question about OT/ICS vulnerabilities. The agent can search NVD, fetch KEV, and get ICS advisories.")
+        st.markdown("Ask any question about OT/ICS vulnerabilities. The agent can search NVD, fetch KEV, get ICS advisories, and understand your network architecture to predict impact.")
 
         if not GROQ_API_KEY:
             st.error("Groq API key not configured. AI Agent disabled.")
         else:
+            # Build network context string for the agent (including EPSS risk)
+            network_context = ""
+            G = build_network_graph(user_email)
+            # Compute EPSS summary for context
+            df, _ = analyze_assets(user_email)
+            asset_epss = get_asset_epss_summary(user_email, df) if not df.empty else pd.DataFrame()
+
+            if G.number_of_nodes() > 0:
+                network_context = "Network Architecture with EPSS risks:\n"
+                for node in G.nodes():
+                    node_data = G.nodes[node]
+                    asset_name = node_data['name']
+                    # Get EPSS stats for this asset
+                    if not asset_epss.empty:
+                        asset_stats = asset_epss[asset_epss["asset"] == asset_name]
+                        if not asset_stats.empty:
+                            epss_info = f" (max EPSS: {asset_stats['max_epss'].iloc[0]:.3f}, risk: {asset_stats['risk_level'].iloc[0]})"
+                        else:
+                            epss_info = ""
+                    else:
+                        epss_info = ""
+                    network_context += f"- Asset {asset_name} (type:{node_data['type']}, location:{node_data['location']}){epss_info}\n"
+                network_context += "Connections:\n"
+                for edge in G.edges():
+                    src = G.nodes[edge[0]]["name"]
+                    tgt = G.nodes[edge[1]]["name"]
+                    rel = G.edges[edge].get("relationship", "connected")
+                    network_context += f"  {src} --({rel})--> {tgt}\n"
+
             if "agent_messages" not in st.session_state:
                 st.session_state.agent_messages = []
 
@@ -825,7 +1174,7 @@ def main():
                     st.markdown(prompt)
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
-                        answer, new_history = agent_query(prompt, st.session_state.agent_messages)
+                        answer, new_history = agent_query(prompt, st.session_state.agent_messages, network_context)
                         st.markdown(answer)
                         st.session_state.agent_messages = new_history
 
