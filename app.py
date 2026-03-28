@@ -5,6 +5,14 @@ import time
 from io import BytesIO
 import plotly.graph_objects as go
 
+# Import Hugging Face Inference Client
+try:
+    from huggingface_hub import InferenceClient
+    HUGGINGFACE_AVAILABLE = True
+except ImportError:
+    HUGGINGFACE_AVAILABLE = False
+    st.warning("Install huggingface-hub: `pip install huggingface-hub` to use the AI assistant.")
+
 # -------------------------------
 # Page configuration
 st.set_page_config(page_title="CVE Risk Dashboard", layout="wide")
@@ -222,9 +230,12 @@ if st.session_state.assets_loaded and st.session_state.results:
     )
 
 # -------------------------------
-# Chatbot Interface
+# Chatbot Interface using huggingface_hub
 st.header("🤖 AI Security Assistant")
 st.markdown("Ask questions about CVEs, remediation, or risk analysis. The assistant can use your current dashboard data as context.")
+
+if not HUGGINGFACE_AVAILABLE:
+    st.error("⚠️ `huggingface-hub` library not installed. Run `pip install huggingface-hub` to enable the AI assistant.")
 
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
@@ -252,33 +263,25 @@ if prompt := st.chat_input("Ask about vulnerabilities..."):
 
     if not st.session_state.hf_token:
         response = "⚠️ Please provide a Hugging Face API token in the sidebar to enable the AI assistant."
+    elif not HUGGINGFACE_AVAILABLE:
+        response = "⚠️ `huggingface-hub` is not installed. Run `pip install huggingface-hub`."
     else:
         with st.spinner("Thinking..."):
             try:
-                # NEW HUGGING FACE ROUTER ENDPOINT
-                api_url = f"https://router.huggingface.co/hf-inference/models/{model_name}"
-                headers = {"Authorization": f"Bearer {st.session_state.hf_token}"}
-                payload = {
-                    "inputs": full_prompt,
-                    "parameters": {"max_new_tokens": 500, "temperature": 0.7, "return_full_text": False}
-                }
-                resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, list) and data and "generated_text" in data[0]:
-                        reply = data[0]["generated_text"]
-                    elif isinstance(data, dict) and "generated_text" in data:
-                        reply = data["generated_text"]
-                    else:
-                        reply = str(data)[:500]
-                else:
-                    reply = f"❌ API error {resp.status_code}: {resp.text[:200]}"
+                client = InferenceClient(token=st.session_state.hf_token)
+                response = client.text_generation(
+                    full_prompt,
+                    model=model_name,
+                    max_new_tokens=500,
+                    temperature=0.7,
+                    return_full_text=False
+                )
             except Exception as e:
-                reply = f"❌ Error: {e}"
+                response = f"❌ Error: {e}"
 
-    st.session_state.chat_history.append({"role": "assistant", "content": reply})
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
     with st.chat_message("assistant"):
-        st.markdown(reply)
+        st.markdown(response)
 
 if st.session_state.results and st.button("📊 Analyze my CVEs"):
     critical_high = [r for r in st.session_state.results if r["severity"] in ["Critical", "High"]]
@@ -293,29 +296,20 @@ if st.session_state.results and st.button("📊 Analyze my CVEs"):
 
     with st.spinner("Analyzing..."):
         try:
-            api_url = f"https://router.huggingface.co/hf-inference/models/{model_name}"
-            headers = {"Authorization": f"Bearer {st.session_state.hf_token}"}
-            payload = {
-                "inputs": prompt,
-                "parameters": {"max_new_tokens": 500, "temperature": 0.7, "return_full_text": False}
-            }
-            resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and data and "generated_text" in data[0]:
-                    reply = data[0]["generated_text"]
-                elif isinstance(data, dict) and "generated_text" in data:
-                    reply = data["generated_text"]
-                else:
-                    reply = str(data)[:500]
-            else:
-                reply = f"❌ API error {resp.status_code}: {resp.text[:200]}"
+            client = InferenceClient(token=st.session_state.hf_token)
+            response = client.text_generation(
+                prompt,
+                model=model_name,
+                max_new_tokens=500,
+                temperature=0.7,
+                return_full_text=False
+            )
         except Exception as e:
-            reply = f"❌ Error: {e}"
+            response = f"❌ Error: {e}"
 
-    st.session_state.chat_history.append({"role": "assistant", "content": reply})
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
     with st.chat_message("assistant"):
-        st.markdown(reply)
+        st.markdown(response)
     st.rerun()
 
 st.markdown("---")
