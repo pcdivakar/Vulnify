@@ -292,6 +292,16 @@ def get_user_assets(email):
     conn.close()
     return rows
 
+def get_asset_metadata(asset_id):
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT metadata FROM asset_metadata WHERE asset_id=?", (asset_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return {}
+
 def delete_asset(asset_id):
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
@@ -371,7 +381,6 @@ def build_network_graph(email):
 
 # ---------- Node Position Persistence ----------
 def save_node_positions(email, positions):
-    """positions: dict {asset_id: (x, y)}"""
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     for asset_id, (x, y) in positions.items():
@@ -398,7 +407,7 @@ def delete_node_positions(email):
     conn.commit()
     conn.close()
 
-# ---------- Vulnerability Analysis Functions ----------
+# ---------- Vulnerability Analysis Functions (Enhanced with Metadata) ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nvd_cve(cve_id: str) -> Optional[Dict]:
     url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
@@ -470,8 +479,36 @@ def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
             pass
     return "Unknown"
 
+def build_asset_search_query(asset_name, asset_type, metadata):
+    """
+    Build a search string for NVD using asset details.
+    Includes: asset_name, asset_type, vendor, model, firmware (if present).
+    """
+    terms = []
+    if asset_name and asset_name != "nan":
+        terms.append(asset_name)
+    if asset_type and asset_type != "nan":
+        terms.append(asset_type)
+    if metadata:
+        if metadata.get("vendor"):
+            terms.append(metadata["vendor"])
+        if metadata.get("model"):
+            terms.append(metadata["model"])
+        if metadata.get("firmware"):
+            terms.append(metadata["firmware"])
+    # Remove duplicates and empty strings
+    terms = list(dict.fromkeys([t.strip() for t in terms if t and t != "nan"]))
+    # Join with spaces
+    query = " ".join(terms)
+    # Boost OT context
+    ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
+    if any(term in query.lower() for term in ot_terms):
+        query += " ics"
+    return query
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_nvd(keyword: str, lookback_months: int, max_results: int = 50) -> List[Dict]:
+def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> List[Dict]:
+    """Search NVD with a constructed query."""
     max_results = int(max_results)
     results = []
     start_index = 0
@@ -479,14 +516,10 @@ def search_nvd(keyword: str, lookback_months: int, max_results: int = 50) -> Lis
     start_date = datetime.now() - timedelta(days=lookback_months * 30)
     end_date = datetime.now()
 
-    ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
-    if any(term in keyword.lower() for term in ot_terms):
-        keyword += " ics"
-
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         params = {
-            "keywordSearch": keyword,
+            "keywordSearch": query,
             "pubStartDate": start_date.strftime("%Y-%m-%dT00:00:00.000Z"),
             "pubEndDate": end_date.strftime("%Y-%m-%dT23:59:59.999Z"),
             "startIndex": start_index,
@@ -558,7 +591,9 @@ def check_new_alerts(user_email, lookback_months):
     kev_list = fetch_kev_catalog()
     new_alerts = []
     for asset_id, asset_name, asset_type, location, _ in assets:
-        cve_list = search_nvd(asset_name, lookback_months, max_results=20)
+        metadata = get_asset_metadata(asset_id)
+        query = build_asset_search_query(asset_name, asset_type, metadata)
+        cve_list = search_nvd(query, lookback_months, max_results=20)
         for item in cve_list:
             cve_id = item["cve"]
             c.execute("SELECT id FROM alerts WHERE email=? AND asset_id=? AND cve_id=?", (user_email, asset_id, cve_id))
@@ -727,6 +762,7 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
             max_results = int(max_results)
         except:
             max_results = 10
+        # For a generic search, we just use the keyword directly
         basic_results = search_nvd(keyword, lookback_months, max_results=max_results)
         if not basic_results:
             return f"No vulnerabilities found for '{keyword}'."
@@ -785,13 +821,18 @@ def analyze_assets(user_email, lookback_months):
     kev_list = fetch_kev_catalog()
     all_vulns = []
     for asset_id, asset_name, asset_type, location, _ in assets:
-        cve_list = search_nvd(asset_name, lookback_months, max_results=20)
+        metadata = get_asset_metadata(asset_id)
+        query = build_asset_search_query(asset_name, asset_type, metadata)
+        cve_list = search_nvd(query, lookback_months, max_results=20)
         for item in cve_list:
             enriched = enrich_cve(item["cve"], kev_list)
             if enriched:
                 enriched["asset"] = asset_name
                 enriched["asset_type"] = asset_type
                 enriched["location"] = location
+                enriched["vendor"] = metadata.get("vendor", "")
+                enriched["model"] = metadata.get("model", "")
+                enriched["firmware"] = metadata.get("firmware", "")
                 all_vulns.append(enriched)
 
     df = pd.DataFrame(all_vulns)
@@ -835,7 +876,9 @@ def get_latest_cves_for_assets(user_email, lookback_months, limit=5):
     kev_list = fetch_kev_catalog()
     all_cves = []
     for asset_id, asset_name, asset_type, location, _ in assets:
-        cve_list = search_nvd(asset_name, lookback_months, max_results=5)
+        metadata = get_asset_metadata(asset_id)
+        query = build_asset_search_query(asset_name, asset_type, metadata)
+        cve_list = search_nvd(query, lookback_months, max_results=5)
         for item in cve_list:
             enriched = enrich_cve(item["cve"], kev_list)
             if enriched:
@@ -848,7 +891,7 @@ def get_latest_cves_for_assets(user_email, lookback_months, limit=5):
     all_cves.sort(key=lambda x: x.get("cvss_score", 0), reverse=True)
     return all_cves[:limit]
 
-# ---------- Network Graph Visualization (with custom positions) ----------
+# ---------- Network Graph Visualization ----------
 def plot_network_graph(email, type_colors, pos=None, seed=None):
     G = build_network_graph(email)
     if G.number_of_nodes() == 0:
@@ -859,7 +902,6 @@ def plot_network_graph(email, type_colors, pos=None, seed=None):
             seed = 42
         pos = nx.spring_layout(G, k=3, iterations=80, seed=seed)
     else:
-        # Ensure all nodes have a position
         for node in G.nodes():
             if node not in pos:
                 pos[node] = (random.uniform(-1,1), random.uniform(-1,1))
@@ -1170,6 +1212,10 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                         id_col = st.selectbox("Asset ID column (for connections)", ["-- Skip --"] + cols, index=0)
                     with col2:
                         conn_col = st.selectbox("Connections column (comma‑separated asset_ids)", ["-- Skip --"] + cols, index=0)
+                        # Additional OT columns
+                        vendor_col = st.selectbox("Vendor column (optional)", ["-- Skip --"] + cols, index=0)
+                        model_col = st.selectbox("Model column (optional)", ["-- Skip --"] + cols, index=0)
+                        firmware_col = st.selectbox("Firmware column (optional)", ["-- Skip --"] + cols, index=0)
                         subnet_col = st.selectbox("Subnet column (optional)", ["-- Skip --"] + cols, index=0)
                         vlan_col = st.selectbox("VLAN column (optional)", ["-- Skip --"] + cols, index=0)
 
@@ -1198,6 +1244,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                                     excel_id_to_db_id[excel_id] = asset_name_to_id[asset_name]
                                 continue
 
+                            # Determine asset type
                             if type_col != "-- Skip --" and pd.notna(row[type_col]):
                                 asset_type = str(row[type_col]).strip()
                                 if asset_type not in type_list:
@@ -1206,18 +1253,27 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                             else:
                                 asset_type = "Other"
 
+                            # Location
                             if loc_col != "-- Skip --" and pd.notna(row[loc_col]):
                                 location = str(row[loc_col]).strip()
                             else:
                                 location = ""
 
+                            # Build metadata including OT‑specific fields
                             metadata = {}
+                            if vendor_col != "-- Skip --" and pd.notna(row[vendor_col]):
+                                metadata["vendor"] = str(row[vendor_col]).strip()
+                            if model_col != "-- Skip --" and pd.notna(row[model_col]):
+                                metadata["model"] = str(row[model_col]).strip()
+                            if firmware_col != "-- Skip --" and pd.notna(row[firmware_col]):
+                                metadata["firmware"] = str(row[firmware_col]).strip()
                             if subnet_col != "-- Skip --" and pd.notna(row[subnet_col]):
                                 metadata["subnet"] = str(row[subnet_col]).strip()
                             if vlan_col != "-- Skip --" and pd.notna(row[vlan_col]):
                                 metadata["vlan"] = str(row[vlan_col]).strip()
+                            # Add any other columns that were not mapped
                             for col in cols:
-                                if col not in [name_col, type_col, loc_col, id_col, conn_col, subnet_col, vlan_col] and pd.notna(row[col]):
+                                if col not in [name_col, type_col, loc_col, id_col, conn_col, vendor_col, model_col, firmware_col, subnet_col, vlan_col] and pd.notna(row[col]):
                                     metadata[col] = str(row[col]).strip()
 
                             added, new_id = add_asset(user_email, asset_name, asset_type, location, metadata if metadata else None)
@@ -1271,12 +1327,17 @@ Assets and their top vulnerabilities (EPSS > 0.5):
             st.info("No assets yet. Add some using the forms above.")
         else:
             for asset_id, asset_name, asset_type, location, created_at in assets:
-                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 2, 1])
+                metadata = get_asset_metadata(asset_id)
+                vendor = metadata.get("vendor", "")
+                model = metadata.get("model", "")
+                firmware = metadata.get("firmware", "")
+                col1, col2, col3, col4, col5, col6 = st.columns([2, 1, 1, 1, 1, 1])
                 col1.write(f"**{asset_name}**")
                 col2.write(asset_type)
-                col3.write(location if location else "—")
-                col4.write(created_at[:10])
-                if col5.button("Delete", key=f"del_{asset_id}"):
+                col3.write(vendor)
+                col4.write(model)
+                col5.write(firmware)
+                if col6.button("Delete", key=f"del_{asset_id}"):
                     delete_asset(asset_id)
                     st.rerun()
 
@@ -1301,43 +1362,31 @@ Assets and their top vulnerabilities (EPSS > 0.5):
             else:
                 pos = None
 
-            # Graph
             fig, current_pos = plot_network_graph(user_email, type_colors, pos=pos, seed=st.session_state.get("graph_seed", 42))
             if fig:
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    if st.button("💾 Save Current Layout"):
-                        # We need to get the positions from the figure after potential drag.
-                        # The user may have moved nodes. We'll capture the positions via JavaScript.
-                        # We'll use a custom component to send the positions back.
-                        # For simplicity, we'll use the current positions from the graph (which are still the original ones)
-                        # unless we implement a full callback. Let's implement a simple JavaScript callback.
-                        # We'll embed a small HTML component that listens to the plotly_relayout event and sends the positions to Streamlit.
-                        # This is complex; we'll provide a basic solution: save the current positions from the graph (which may be the spring layout).
-                        # However, we already have a way: we can use the `relayoutData` from the chart.
-                        # We'll store the positions in session_state when the user drags.
-                        # Actually, the easiest is to use the `plotly_chart` with `on_change` and a callback.
-                        # Let's implement that.
-                        pass
-
+                    # For simplicity, we use a session-only layout; saving positions would require JavaScript.
+                    # We'll keep the drag capability but not persistence for now.
+                    pass
                 with col2:
                     if st.button("🔄 Reset Layout"):
                         delete_node_positions(user_email)
                         st.rerun()
-
                 with col3:
                     if st.button("📐 Spring Layout"):
                         delete_node_positions(user_email)
                         st.rerun()
 
-                # We'll use a custom JavaScript callback to capture drag events.
-                # For brevity, I'll embed a small HTML that sends the positions back.
-                # This is a known technique: use `st.components.v1.html` with a JavaScript that listens to the plotly graph's `relayout` event and sends data to Python via Streamlit's `setComponentValue`.
-                # Because of length, I'll provide the full working implementation in the final code.
-                # For now, I'll assume the drag feature works interactively without saving, but with the save button we need the callback.
-                # I'll include the full JavaScript solution in the final code.
-                pass
-
+                st.markdown('<div class="graph-container">', unsafe_allow_html=True)
+                st.plotly_chart(fig, use_container_width=True, config={
+                    'displayModeBar': True,
+                    'editable': True,          # allows dragging markers
+                    'scrollZoom': True,
+                    'doubleClick': 'reset+autosize'
+                })
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.caption("💡 Tip: You can drag nodes to any position. To reset, click 'Reset Layout'.")
             else:
                 st.info("Not enough nodes to display graph (need at least one asset).")
 
