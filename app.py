@@ -1,505 +1,327 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import requests
-from datetime import datetime, timedelta
 import time
 import json
-from typing import Dict, List, Optional, Tuple
+from io import BytesIO
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# ---------- Page Configuration ----------
-st.set_page_config(
-    page_title="OT Threat Intelligence",
-    page_icon="🛡️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# -------------------------------
+# Page configuration
+st.set_page_config(page_title="CVE Risk Dashboard", layout="wide")
+st.title("🛡️ VulnRisk Dashboard")
+st.markdown("Powered by **NIST NVD v2.0** and **Hugging Face AI**")
 
-# ---------- Load Secrets ----------
-try:
-    NVD_API_KEY = st.secrets.get("NVD_API_KEY", None)
-except:
-    NVD_API_KEY = None
+# -------------------------------
+# Session state initialization
+if "results" not in st.session_state:
+    st.session_state.results = []          # list of dicts: asset, cveId, description, severity, score, vector, sevClass, mitigationUrl
+if "hf_token" not in st.session_state:
+    st.session_state.hf_token = ""
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "assets_loaded" not in st.session_state:
+    st.session_state.assets_loaded = False
 
-try:
-    HF_API_KEY = st.secrets["HF_API_KEY"]
-except:
-    HF_API_KEY = None
+# -------------------------------
+# Sidebar: NVD API settings
+with st.sidebar:
+    st.header("NVD API Configuration")
+    nvd_api_key = st.text_input("NVD API Key (optional)", type="password", help="Increases rate limit to 50 requests per 30 seconds")
+    st.markdown("---")
+    st.header("Hugging Face AI Assistant")
+    hf_token = st.text_input("Hugging Face API Token", type="password", value=st.session_state.hf_token, help="Get token at huggingface.co/settings/tokens")
+    if st.button("Save HF Token"):
+        st.session_state.hf_token = hf_token
+        st.success("Token saved!")
+    model_name = st.selectbox("Model", ["mistralai/Mistral-7B-Instruct-v0.2", "HuggingFaceH4/zephyr-7b-beta", "google/flan-t5-xl"], index=0)
 
-# ---------- Helper Functions ----------
-def safe_float(x):
-    try:
-        return float(x)
-    except (ValueError, TypeError):
-        return 0.0
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_nvd_cve(cve_id: str) -> Optional[Dict]:
-    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
-    headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data["vulnerabilities"]:
-                vuln = data["vulnerabilities"][0]["cve"]
-                metrics = vuln.get("metrics", {})
-                cvss_v3 = metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
-                score = cvss_v3.get("baseScore", "N/A")
-                desc = vuln.get("descriptions", [{}])[0].get("value", "")
-                return {"cve": cve_id, "cvss_score": score, "description": desc}
-    except Exception:
-        pass
-    return None
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_epss(cve_id: str) -> Optional[float]:
-    url = f"https://api.first.org/data/v1/epss?cve={cve_id}"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("data"):
-                return float(data["data"][0]["epss"])
-    except Exception:
-        pass
-    return None
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_kev_catalog() -> List[Dict]:
-    url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("vulnerabilities", [])
-    except Exception:
-        pass
-    return []
-
-def is_in_kev(cve_id: str, kev_list: List[Dict]) -> bool:
-    for item in kev_list:
-        if item.get("cveID") == cve_id:
-            return True
-    return False
-
-def fetch_ics_advisories() -> List[Dict]:
-    url = "https://www.cisa.gov/sites/default/files/feeds/ics-advisories.json"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("advisories", [])
-    except Exception:
-        pass
-    return []
-
-def search_nvd(keyword: str, max_results: int = 20, lookback_months: int = 24) -> Tuple[List[Dict], int]:
-    """Search NVD for CVEs matching keyword. Returns (list, total_count)."""
-    start_date = datetime.now() - timedelta(days=lookback_months * 30)
-    end_date = datetime.now()
-    results = []
-    start_index = 0
-    total_count = 0
-    while len(results) < max_results:
-        url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-        params = {
-            "keywordSearch": keyword,
-            "pubStartDate": start_date.strftime("%Y-%m-%dT00:00:00.000Z"),
-            "pubEndDate": end_date.strftime("%Y-%m-%dT23:59:59.999Z"),
-            "startIndex": start_index,
-            "resultsPerPage": min(50, max_results - len(results)),
-        }
-        headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                total_count = data.get("totalResults", 0)
-                vulns = data.get("vulnerabilities", [])
-                if not vulns:
-                    break
-                for item in vulns:
-                    cve = item["cve"]
-                    results.append({
-                        "cve": cve["id"],
-                        "description": cve["descriptions"][0]["value"],
-                        "published": cve["published"],
-                    })
-                start_index += len(vulns)
-                if start_index >= total_count:
-                    break
-                time.sleep(0.2)
-            elif resp.status_code == 404:
-                break
-            else:
-                st.error(f"NVD search error {resp.status_code}")
-                break
-        except Exception as e:
-            st.error(f"Search error: {e}")
-            break
-    return results[:max_results], total_count
-
-def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
-    nvd = fetch_nvd_cve(cve_id)
-    if not nvd:
-        return None
-    epss = fetch_epss(cve_id)
-    in_kev = is_in_kev(cve_id, kev_list)
-    try:
-        cvss = float(nvd["cvss_score"])
-    except (ValueError, TypeError):
-        cvss = "N/A"
-    return {
-        "cve": cve_id,
-        "cvss_score": cvss,
-        "epss": epss,
-        "kev": in_kev,
-        "description": nvd["description"]
-    }
-
-def analyze_assets(df, column_map, lookback_months=24):
-    """Analyze each asset using mapped columns (asset_name, asset_type, vendor, model)."""
-    kev_list = fetch_kev_catalog()
-    all_vulns = []
-    debug_info = []  # (asset_name, query, results_count)
-    for _, row in df.iterrows():
-        terms = []
-        for field in ["asset_name", "asset_type", "vendor", "model"]:
-            col = column_map.get(field)
-            if col and pd.notna(row[col]) and str(row[col]).strip():
-                terms.append(str(row[col]).strip())
-        if not terms:
-            continue
-        query = " ".join(terms)
-        cve_list, total_count = search_nvd(query, max_results=10, lookback_months=lookback_months)
-        debug_info.append((row.get(column_map.get("asset_name", ""), "Unknown"), query, total_count))
-        for cve_info in cve_list:
-            enriched = enrich_cve(cve_info["cve"], kev_list)
-            if enriched:
-                enriched["asset"] = row.get(column_map.get("asset_name", ""), "Unknown")
-                enriched["asset_type"] = row.get(column_map.get("asset_type", ""), "")
-                enriched["vendor"] = row.get(column_map.get("vendor", ""), "")
-                enriched["model"] = row.get(column_map.get("model", ""), "")
-                all_vulns.append(enriched)
-    df_vulns = pd.DataFrame(all_vulns)
-    return df_vulns, debug_info
-
-def manual_asset_search(asset_names, lookback_months=24):
-    """Process a list of asset names (strings) and return vulnerabilities DataFrame."""
-    kev_list = fetch_kev_catalog()
-    all_vulns = []
-    debug_info = []
-    for asset_name in asset_names:
-        query = asset_name.strip()
-        if not query:
-            continue
-        cve_list, total_count = search_nvd(query, max_results=10, lookback_months=lookback_months)
-        debug_info.append((asset_name, query, total_count))
-        for cve_info in cve_list:
-            enriched = enrich_cve(cve_info["cve"], kev_list)
-            if enriched:
-                enriched["asset"] = asset_name
-                all_vulns.append(enriched)
-    df_vulns = pd.DataFrame(all_vulns)
-    return df_vulns, debug_info
-
-def generate_threat_summary(df_vulns, assets_count):
-    """Generate AI summary using Hugging Face Inference API."""
-    if df_vulns.empty:
-        return "No vulnerabilities found for the uploaded assets."
-    top_cves = df_vulns.nlargest(10, "cvss_score")[["cve", "cvss_score", "kev", "description"]]
-    summary_stats = {
-        "total_vulns": len(df_vulns),
-        "critical": len(df_vulns[df_vulns["cvss_score"] >= 9.0]),
-        "high": len(df_vulns[(df_vulns["cvss_score"] >= 7.0) & (df_vulns["cvss_score"] < 9.0)]),
-        "kev_count": df_vulns["kev"].sum(),
-        "assets_affected": df_vulns["asset"].nunique(),
-        "top_assets": df_vulns.groupby("asset").size().sort_values(ascending=False).head(5).to_dict(),
-    }
-    prompt = f"""You are a cybersecurity analyst. Based on the following vulnerability data from NVD, EPSS, and CISA KEV, provide a concise summary of the threat landscape for the uploaded OT assets.
-
-Assets analyzed: {assets_count}
-
-Vulnerability statistics:
-- Total vulnerabilities found: {summary_stats['total_vulns']}
-- Critical (CVSS >= 9.0): {summary_stats['critical']}
-- High (CVSS 7.0-8.9): {summary_stats['high']}
-- Known exploited (CISA KEV): {summary_stats['kev_count']}
-- Assets affected: {summary_stats['assets_affected']}
-- Top affected assets: {json.dumps(summary_stats['top_assets'])}
-
-Top 10 CVEs by CVSS score:
-{top_cves.to_string()}
-
-Also consider any relevant ICS‑CERT advisories that might affect these assets (not included here). 
-Write a brief summary highlighting the most critical risks and recommended immediate actions."""
-    
-    if not HF_API_KEY:
-        return "Hugging Face API key not configured. Cannot generate summary."
-
-    url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
-    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-    payload = {
-        "inputs": f"<s>[INST] {prompt} [/INST]",
-        "parameters": {
-            "max_new_tokens": 800,
-            "temperature": 0.3,
-            "return_full_text": False
-        }
-    }
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0].get("generated_text", "No response").strip()
-        else:
-            return "Error: Unexpected response format."
-    except Exception as e:
-        return f"Error generating summary: {e}"
-
-def hf_chat(prompt: str, context: str) -> str:
-    """Chat using Hugging Face Inference API."""
-    if not HF_API_KEY:
-        return "Hugging Face API key not configured."
-    url = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
-    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
-    system_msg = f"You are a cybersecurity analyst specialized in OT/ICS vulnerabilities. Use the following asset context to answer questions.\n\nAsset Context:\n{context}\n\n"
-    full_prompt = f"<s>[INST] {system_msg}{prompt} [/INST]"
-    payload = {
-        "inputs": full_prompt,
-        "parameters": {
-            "max_new_tokens": 512,
-            "temperature": 0.3,
-            "return_full_text": False
-        }
-    }
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0].get("generated_text", "No response").strip()
-        else:
-            return "Error: Unexpected response format."
-    except Exception as e:
-        return f"Error: {e}"
-
-# ---------- Streamlit UI ----------
-def main():
-    st.title("🛡️ OT Threat Intelligence")
-    st.markdown("Upload an Excel/CSV file with your OT assets, then map columns to asset fields. The AI will analyze vulnerabilities and provide a summary.")
-
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        lookback_months = st.slider(
-            "Lookback months (how far back to search for CVEs)",
-            min_value=1, max_value=120, value=24, step=1,
-            help="Increase if you want to see older CVEs."
-        )
-        st.session_state.lookback_months = lookback_months
-
-        st.markdown("---")
-        st.subheader("🔎 Quick Keyword Test")
-        test_keyword = st.text_input("Enter a keyword (e.g., 'Siemens S7-1200')")
-        if st.button("Test NVD Search"):
-            if test_keyword:
-                with st.spinner("Searching NVD..."):
-                    results, total = search_nvd(test_keyword, max_results=5, lookback_months=lookback_months)
-                    if results:
-                        st.success(f"Found {total} total CVEs. First 5:")
-                        for r in results:
-                            st.write(f"- {r['cve']}: {r['description'][:100]}...")
-                    else:
-                        st.warning("No results. Try different keywords or increase lookback.")
-
-    # ---------- Manual Asset Search (like the HTML tool) ----------
-    st.markdown("## 🔎 Manual Asset Search (like the HTML tool)")
-    with st.expander("Click to expand – Enter assets manually or upload a file", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            asset_text = st.text_area("Asset names (one per line)", height=150, key="manual_assets")
-        with col2:
-            uploaded_file_manual = st.file_uploader("Or upload Excel/CSV (first column used)", type=["xlsx", "csv"], key="manual_file")
-            if uploaded_file_manual:
-                try:
-                    if uploaded_file_manual.name.endswith('.csv'):
-                        df_manual = pd.read_csv(uploaded_file_manual)
-                    else:
-                        df_manual = pd.read_excel(uploaded_file_manual)
-                    # Take first column as asset names
-                    asset_names_from_file = df_manual.iloc[:, 0].dropna().astype(str).tolist()
-                    asset_text = "\n".join(asset_names_from_file)
-                    st.success(f"Loaded {len(asset_names_from_file)} assets from file.")
-                except Exception as e:
-                    st.error(f"Error reading file: {e}")
-
-        if st.button("Find CVEs", key="manual_search_btn"):
-            assets = [line.strip() for line in asset_text.split("\n") if line.strip()]
-            if not assets:
-                st.warning("Please enter at least one asset name.")
-            else:
-                with st.spinner("Searching NVD..."):
-                    df_vulns, debug_info = manual_asset_search(assets, lookback_months=lookback_months)
-
-                # Display debug info
-                with st.expander("🔍 Search Query Debug (manual)"):
-                    for name, query, count in debug_info:
-                        st.write(f"**{name}**: `{query}` → {count} results")
-                    st.caption("If a query returns zero results, try simplifying the query or increasing lookback.")
-
-                if df_vulns.empty:
-                    st.warning("No vulnerabilities found for the entered assets.")
-                else:
-                    st.success(f"Found {len(df_vulns)} vulnerabilities for {len(assets)} assets.")
-
-                    # Summary stats
-                    total = len(df_vulns)
-                    critical = len(df_vulns[df_vulns["cvss_score"] >= 9.0])
-                    high = len(df_vulns[(df_vulns["cvss_score"] >= 7.0) & (df_vulns["cvss_score"] < 9.0)])
-                    assets_affected = df_vulns["asset"].nunique()
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Total CVEs", total)
-                    with col2:
-                        st.metric("Critical", critical)
-                    with col3:
-                        st.metric("High", high)
-                    with col4:
-                        st.metric("Assets Affected", assets_affected)
-
-                    # Severity distribution chart (doughnut)
-                    severity_counts = {
-                        "Critical": critical,
-                        "High": high,
-                        "Medium": len(df_vulns[(df_vulns["cvss_score"] >= 4.0) & (df_vulns["cvss_score"] < 7.0)]),
-                        "Low": len(df_vulns[df_vulns["cvss_score"] < 4.0])
-                    }
-                    fig = px.pie(
-                        names=list(severity_counts.keys()),
-                        values=list(severity_counts.values()),
-                        title="Severity Distribution",
-                        color=list(severity_counts.keys()),
-                        color_discrete_map={"Critical": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"}
-                    )
-                    fig.update_traces(textposition='inside', textinfo='percent+label', hole=0.4)
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    # Table of results
-                    st.subheader("Vulnerability Details")
-                    display_df = df_vulns[["asset", "cve", "cvss_score", "epss", "kev", "description"]].copy()
-                    display_df["cvss_score"] = pd.to_numeric(display_df["cvss_score"], errors="coerce").round(1)
-                    display_df["epss"] = pd.to_numeric(display_df["epss"], errors="coerce").round(4)
-                    display_df["kev"] = display_df["kev"].apply(lambda x: "Yes" if x else "No")
-                    st.dataframe(display_df, use_container_width=True)
-
-    # ---------- Main Analysis (with column mapping) ----------
-    st.markdown("## 📊 Detailed Asset Analysis (with column mapping)")
-    uploaded_file = st.file_uploader("Choose Excel/CSV file", type=["xlsx", "csv"], key="main_file")
+# -------------------------------
+# Main area: input panel
+st.header("🔍 Vulnerability Assessment")
+col1, col2 = st.columns(2)
+with col1:
+    asset_input = st.text_area("Manual Asset List", "apache log4j\nwindows server 2019", height=150)
+with col2:
+    uploaded_file = st.file_uploader("Import from Excel or CSV", type=["csv", "xlsx", "xls"])
     if uploaded_file:
         try:
             if uploaded_file.name.endswith('.csv'):
                 df = pd.read_csv(uploaded_file)
             else:
                 df = pd.read_excel(uploaded_file)
-
-            st.success(f"Loaded {len(df)} rows.")
-            st.dataframe(df.head())
-
-            # Column mapping
-            st.subheader("Map Columns to Asset Fields")
-            col_map = {}
-            cols = df.columns.tolist()
-            with st.form("column_mapping"):
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    col_map["asset_name"] = st.selectbox("Asset Name", ["-- None --"] + cols, index=0)
-                    col_map["vendor"] = st.selectbox("Vendor (optional)", ["-- None --"] + cols, index=0)
-                with col2:
-                    col_map["asset_type"] = st.selectbox("Asset Type (optional)", ["-- None --"] + cols, index=0)
-                    col_map["model"] = st.selectbox("Model (optional)", ["-- None --"] + cols, index=0)
-                submit = st.form_submit_button("Analyze Assets")
-
-            if submit:
-                col_map = {k: v for k, v in col_map.items() if v != "-- None --"}
-                if "asset_name" not in col_map:
-                    st.error("Asset Name is required for analysis.")
-                    return
-
-                with st.spinner("Analyzing assets for vulnerabilities (this may take a few minutes)..."):
-                    df_vulns, debug_info = analyze_assets(df, col_map, lookback_months=lookback_months)
-                    st.session_state.vuln_df = df_vulns
-                    st.session_state.asset_df = df
-                    st.session_state.asset_count = len(df)
-                    st.session_state.debug_info = debug_info
-                    # Create a context string for the chatbot
-                    asset_str = df[list(col_map.values())].head(20).to_string()
-                    st.session_state.asset_context = f"Assets ({len(df)} rows):\n{asset_str}\n\nVulnerabilities found: {len(df_vulns)}"
-                    if not df_vulns.empty:
-                        st.session_state.asset_context += f"\nTop CVEs:\n{df_vulns[['cve','cvss_score','kev','description']].head(10).to_string()}"
-
-                # Debug expander
-                with st.expander("🔍 Search Query Debug (mapped assets)"):
-                    for name, query, count in debug_info:
-                        st.write(f"**{name}**: `{query}` → {count} results")
-                    st.caption("If a query returns zero results, try simplifying the query (use fewer terms) or increasing the lookback months.")
-
-                if df_vulns.empty:
-                    st.warning("No vulnerabilities found. Check the debug info to see which queries returned zero results. You can also use the manual test search in the sidebar to experiment.")
-                else:
-                    with st.spinner("Generating threat summary..."):
-                        summary = generate_threat_summary(df_vulns, len(df))
-                        st.subheader("📊 Threat Landscape Summary")
-                        st.write(summary)
-
-                    # Dashboards
-                    st.subheader("📈 Vulnerability Dashboard")
-                    # CVSS Distribution
-                    fig1 = px.histogram(df_vulns, x="cvss_score", nbins=20, title="CVSS Score Distribution")
-                    st.plotly_chart(fig1, use_container_width=True)
-
-                    # Risk level pie chart
-                    df_vulns["risk_level"] = pd.cut(df_vulns["cvss_score"], bins=[0, 4, 7, 9, 10], labels=["Low", "Medium", "High", "Critical"])
-                    risk_counts = df_vulns["risk_level"].value_counts().reset_index()
-                    fig2 = px.pie(risk_counts, values="count", names="risk_level", title="Risk Level Distribution")
-                    st.plotly_chart(fig2, use_container_width=True)
-
-                    # Top affected assets
-                    top_assets = df_vulns["asset"].value_counts().head(10).reset_index()
-                    fig3 = px.bar(top_assets, x="asset", y="count", title="Top 10 Affected Assets")
-                    st.plotly_chart(fig3, use_container_width=True)
-
-                    # Table of top CVEs
-                    st.subheader("Top 10 Critical CVEs")
-                    top_cves = df_vulns.nlargest(10, "cvss_score")[["cve", "cvss_score", "epss", "kev", "description", "asset"]]
-                    st.dataframe(top_cves)
-
+            assets_from_file = df.iloc[:, 0].dropna().astype(str).tolist()
+            asset_input = "\n".join(assets_from_file)
+            st.success(f"Loaded {len(assets_from_file)} assets")
         except Exception as e:
-            st.error(f"Error processing file: {e}")
+            st.error(f"Error reading file: {e}")
 
-    # Chatbot section
-    st.markdown("---")
-    st.subheader("💬 Ask the AI Analyst")
-    st.markdown("Ask questions about the assets, vulnerabilities, or any related threats.")
+# Date range
+col3, col4 = st.columns(2)
+with col3:
+    start_date = st.date_input("Published Start Date", value=None)
+with col4:
+    end_date = st.date_input("Published End Date", value=None)
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+# Search button
+if st.button("🔍 Find CVEs", type="primary"):
+    assets = [a.strip() for a in asset_input.split("\n") if a.strip()]
+    if not assets:
+        st.error("Please enter at least one asset.")
+    else:
+        with st.spinner("Querying NVD..."):
+            all_cves = []
+            progress_bar = st.progress(0)
+            for i, asset in enumerate(assets):
+                # Build NVD API URL
+                url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+                params = {
+                    "keywordSearch": asset,
+                    "resultsPerPage": 20
+                }
+                if start_date:
+                    params["pubStartDate"] = start_date.strftime("%Y-%m-%dT00:00:00.000Z")
+                if end_date:
+                    params["pubEndDate"] = end_date.strftime("%Y-%m-%dT23:59:59.999Z")
+                headers = {}
+                if nvd_api_key:
+                    headers["apiKey"] = nvd_api_key
+                try:
+                    resp = requests.get(url, params=params, headers=headers, timeout=30)
+                    if resp.status_code == 403:
+                        st.error(f"API key invalid or rate limited for asset {asset}. Skipping.")
+                        continue
+                    elif resp.status_code != 200:
+                        st.error(f"Error {resp.status_code} for asset {asset}: {resp.text[:200]}")
+                        continue
+                    data = resp.json()
+                    vulnerabilities = data.get("vulnerabilities", [])
+                    for vuln in vulnerabilities:
+                        cve = vuln["cve"]
+                        cve_id = cve["id"]
+                        desc = next((d["value"] for d in cve.get("descriptions", []) if d["lang"] == "en"), "No description")
+                        metrics = cve.get("metrics", {})
+                        # Extract CVSS info
+                        cvss_data = None
+                        if "cvssMetricV31" in metrics and metrics["cvssMetricV31"]:
+                            cvss_data = metrics["cvssMetricV31"][0].get("cvssData")
+                        elif "cvssMetricV30" in metrics and metrics["cvssMetricV30"]:
+                            cvss_data = metrics["cvssMetricV30"][0].get("cvssData")
+                        elif "cvssMetricV2" in metrics and metrics["cvssMetricV2"]:
+                            cvss_data = metrics["cvssMetricV2"][0].get("cvssData")
+                        if cvss_data:
+                            score = cvss_data.get("baseScore")
+                            severity = cvss_data.get("baseSeverity", "")
+                            if not severity:
+                                if score >= 7.0: severity = "HIGH"
+                                elif score >= 4.0: severity = "MEDIUM"
+                                else: severity = "LOW"
+                            vector = cvss_data.get("vectorString", "")
+                        else:
+                            score = None
+                            severity = "N/A"
+                            vector = ""
+                        # Map severity to CSS-like class (for display)
+                        sev_class = {
+                            "CRITICAL": "severity-critical",
+                            "HIGH": "severity-high",
+                            "MEDIUM": "severity-medium",
+                            "LOW": "severity-low"
+                        }.get(severity.upper(), "")
+                        # Get mitigation URL (first reference, prefer vendor advisory)
+                        refs = cve.get("references", [])
+                        mitigation_url = None
+                        for ref in refs:
+                            if "tags" in ref and "Vendor Advisory" in ref["tags"]:
+                                mitigation_url = ref["url"]
+                                break
+                        if not mitigation_url and refs:
+                            mitigation_url = refs[0]["url"]
+                        all_cves.append({
+                            "asset": asset,
+                            "cveId": cve_id,
+                            "description": desc,
+                            "severity": severity.capitalize(),
+                            "score": score,
+                            "vector": vector,
+                            "sevClass": sev_class,
+                            "mitigationUrl": mitigation_url
+                        })
+                except Exception as e:
+                    st.error(f"Error fetching for {asset}: {e}")
+                # Rate limiting
+                time.sleep(0.6 if nvd_api_key else 6.0)
+                progress_bar.progress((i+1)/len(assets))
+            st.session_state.results = all_cves
+            st.session_state.assets_loaded = True
+            st.success(f"Found {len(all_cves)} CVEs across {len(assets)} assets.")
+            st.rerun()
 
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+# -------------------------------
+# Display results if available
+if st.session_state.assets_loaded and st.session_state.results:
+    results = st.session_state.results
+    df_results = pd.DataFrame(results)
 
-    if prompt := st.chat_input("Ask a question..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    # Stats
+    total = len(results)
+    critical = sum(1 for r in results if r["severity"] == "Critical")
+    high = sum(1 for r in results if r["severity"] == "High")
+    assets_count = len(set(r["asset"] for r in results))
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                context = st.session_state.get("asset_context", "No assets uploaded yet.")
-                answer = hf_chat(prompt, context)
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total CVEs", total)
+    col2.metric("Critical", critical)
+    col3.metric("High", high)
+    col4.metric("Assets Scanned", assets_count)
 
-if __name__ == "__main__":
-    main()
+    # Severity chart
+    severity_counts = {
+        "Critical": critical,
+        "High": high,
+        "Medium": sum(1 for r in results if r["severity"] == "Medium"),
+        "Low": sum(1 for r in results if r["severity"] == "Low"),
+        "Unknown": sum(1 for r in results if r["severity"] not in ["Critical", "High", "Medium", "Low"])
+    }
+    fig = go.Figure(data=[go.Pie(labels=list(severity_counts.keys()), values=list(severity_counts.values()), hole=0.7, marker_colors=["#7f1d1d", "#991b1b", "#b45309", "#065f46", "#64748b"])])
+    fig.update_layout(title="Severity Distribution", height=400)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Scrollable table
+    st.subheader("Discovered Vulnerabilities")
+    # Convert to dataframe for display, but we want custom formatting
+    # We'll use st.dataframe with column configuration
+    display_df = df_results[["asset", "cveId", "severity", "score", "vector", "description", "mitigationUrl"]].copy()
+    # Add clickable links
+    display_df["CVE Link"] = display_df["cveId"].apply(lambda x: f"https://nvd.nist.gov/vuln/detail/{x}")
+    display_df["Mitigation"] = display_df["mitigationUrl"].apply(lambda x: f"[Advisory]({x})" if x else "N/A")
+    display_df.rename(columns={
+        "asset": "Asset",
+        "cveId": "CVE ID",
+        "severity": "Risk",
+        "score": "CVSS Score",
+        "vector": "Vector",
+        "description": "Description"
+    }, inplace=True)
+    # Use st.dataframe with height and column config
+    st.dataframe(
+        display_df[["Asset", "CVE ID", "Risk", "CVSS Score", "Vector", "Description", "Mitigation"]],
+        use_container_width=True,
+        height=400,
+        column_config={
+            "CVE ID": st.column_config.LinkColumn("CVE ID", display_text="(.*)"),
+            "Mitigation": st.column_config.LinkColumn("Mitigation", display_text="Advisory"),
+            "Risk": st.column_config.TextColumn("Risk", width="small"),
+            "CVSS Score": st.column_config.NumberColumn("CVSS Score", format="%.1f"),
+            "Description": st.column_config.TextColumn("Description", width="large")
+        }
+    )
+
+# -------------------------------
+# Chatbot Interface
+st.header("🤖 AI Security Assistant")
+st.markdown("Ask questions about CVEs, remediation, or risk analysis. The assistant can use your current dashboard data as context.")
+
+# Display chat history
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Chat input
+if prompt := st.chat_input("Ask about vulnerabilities..."):
+    # Add user message
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Build context from current CVEs
+    context = ""
+    if st.session_state.results:
+        critical_high = [r for r in st.session_state.results if r["severity"] in ["Critical", "High"]]
+        if critical_high:
+            context = "Current dashboard shows these critical/high CVEs:\n"
+            for c in critical_high[:5]:
+                context += f"- {c['cveId']} ({c['severity']}): {c['description'][:120]}...\n"
+            context += "\n"
+    # Build prompt for HF model
+    system = "You are a cybersecurity expert specializing in CVE analysis, risk scoring, and mitigation. Provide concise, actionable advice."
+    model = model_name
+    if "mistral" in model or "zephyr" in model:
+        full_prompt = f"<s>[INST] {system} {context} {prompt} [/INST]"
+    else:
+        full_prompt = f"{system}\n{context}User: {prompt}\nAssistant:"
+    
+    # Call Hugging Face inference
+    if not st.session_state.hf_token:
+        response = "⚠️ Please provide a Hugging Face API token in the sidebar to enable the AI assistant."
+    else:
+        with st.spinner("Thinking..."):
+            try:
+                api_url = f"https://api-inference.huggingface.co/models/{model}"
+                headers = {"Authorization": f"Bearer {st.session_state.hf_token}"}
+                payload = {
+                    "inputs": full_prompt,
+                    "parameters": {"max_new_tokens": 500, "temperature": 0.7, "return_full_text": False}
+                }
+                resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and data and "generated_text" in data[0]:
+                        reply = data[0]["generated_text"]
+                    elif isinstance(data, dict) and "generated_text" in data:
+                        reply = data["generated_text"]
+                    else:
+                        reply = str(data)[:500]
+                else:
+                    reply = f"❌ API error {resp.status_code}: {resp.text[:200]}"
+            except Exception as e:
+                reply = f"❌ Error: {e}"
+    
+    # Add assistant response
+    st.session_state.chat_history.append({"role": "assistant", "content": reply})
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+
+# Optional: "Analyze my CVEs" button
+if st.session_state.results and st.button("📊 Analyze my CVEs"):
+    # Automatically send a context-aware prompt
+    context = "Current dashboard shows these critical/high CVEs:\n"
+    critical_high = [r for r in st.session_state.results if r["severity"] in ["Critical", "High"]]
+    for c in critical_high[:10]:
+        context += f"- {c['cveId']} ({c['severity']}): {c['description'][:120]}...\n"
+    prompt = f"Please analyze the current vulnerabilities from my dashboard: I have {len(st.session_state.results)} total CVEs (Critical: {sum(1 for r in st.session_state.results if r['severity']=='Critical')}, High: {sum(1 for r in st.session_state.results if r['severity']=='High')}). Give me top 3 remediation priorities and risk summary."
+    # Add user message automatically
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    # Call AI
+    with st.spinner("Analyzing..."):
+        try:
+            api_url = f"https://api-inference.huggingface.co/models/{model_name}"
+            headers = {"Authorization": f"Bearer {st.session_state.hf_token}"}
+            payload = {
+                "inputs": prompt,
+                "parameters": {"max_new_tokens": 500, "temperature": 0.7, "return_full_text": False}
+            }
+            resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and data and "generated_text" in data[0]:
+                    reply = data[0]["generated_text"]
+                elif isinstance(data, dict) and "generated_text" in data:
+                    reply = data["generated_text"]
+                else:
+                    reply = str(data)[:500]
+            else:
+                reply = f"❌ API error {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            reply = f"❌ Error: {e}"
+    st.session_state.chat_history.append({"role": "assistant", "content": reply})
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+    st.rerun()
+
+# Footer
+st.markdown("---")
+st.markdown("Data from NIST NVD. AI responses are generated and should be verified.")
