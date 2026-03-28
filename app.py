@@ -38,7 +38,7 @@ try:
 except:
     GROQ_API_KEY = None
 
-# Email settings (for sending alerts)
+# Email settings
 try:
     SMTP_SERVER = st.secrets["SMTP_SERVER"]
     SMTP_PORT = int(st.secrets["SMTP_PORT"])
@@ -50,9 +50,7 @@ except:
 # ---------- Custom CSS ----------
 st.markdown("""
 <style>
-    .stApp {
-        background-color: #f5f7fb;
-    }
+    .stApp { background-color: #f5f7fb; }
     .main-header {
         font-size: 2rem;
         font-weight: 600;
@@ -67,57 +65,19 @@ st.markdown("""
         padding: 1rem;
         box-shadow: 0 1px 3px rgba(0,0,0,0.05);
         border: 1px solid #e5e7eb;
-        transition: all 0.2s;
     }
-    .metric-card:hover {
-        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-    }
-    .stat-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #111827;
-    }
-    .stat-label {
-        font-size: 0.85rem;
-        color: #6b7280;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-    .risk-critical {
-        color: #dc2626;
-        font-weight: 600;
-    }
-    .risk-high {
-        color: #f97316;
-        font-weight: 600;
-    }
-    .risk-medium {
-        color: #eab308;
-        font-weight: 600;
-    }
-    .risk-low {
-        color: #10b981;
-        font-weight: 600;
-    }
+    .stat-value { font-size: 1.8rem; font-weight: 700; color: #111827; }
+    .stat-label { font-size: 0.85rem; color: #6b7280; text-transform: uppercase; }
+    .risk-critical { color: #dc2626; font-weight: 600; }
+    .risk-high { color: #f97316; font-weight: 600; }
+    .risk-medium { color: #eab308; font-weight: 600; }
+    .risk-low { color: #10b981; font-weight: 600; }
     .stButton > button {
         background-color: #3b82f6;
         color: white;
         border-radius: 6px;
         border: none;
         padding: 0.5rem 1rem;
-        font-weight: 500;
-    }
-    .stButton > button:hover {
-        background-color: #2563eb;
-    }
-    .stTextInput > div > input, .stTextArea > div > textarea {
-        border-radius: 6px;
-        border: 1px solid #e5e7eb;
-    }
-    .stDataFrame {
-        border-radius: 12px;
-        overflow: hidden;
-        border: 1px solid #e5e7eb;
     }
     .graph-container {
         background: white;
@@ -130,62 +90,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Database Setup ----------
+# ---------- Database Setup (same as before) ----------
 def init_db():
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (email TEXT PRIMARY KEY,
-                  name TEXT,
-                  created_at TIMESTAMP,
-                  last_alert_check TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS assets
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  email TEXT,
-                  asset_name TEXT,
-                  asset_type TEXT,
-                  location TEXT,
-                  created_at TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS asset_metadata
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  asset_id INTEGER,
-                  metadata TEXT,
-                  FOREIGN KEY(asset_id) REFERENCES assets(id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS alerts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  email TEXT,
-                  asset_id INTEGER,
-                  cve_id TEXT,
-                  sent_at TIMESTAMP,
-                  status TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS connections
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  email TEXT,
-                  source_asset_id INTEGER,
-                  target_asset_id INTEGER,
-                  relationship_type TEXT,
-                  created_at TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS asset_types
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  email TEXT,
-                  type_name TEXT,
-                  is_default INTEGER,
-                  created_at TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS node_positions
-                 (email TEXT,
-                  asset_id INTEGER,
-                  x REAL,
-                  y REAL,
-                  last_updated TIMESTAMP,
-                  PRIMARY KEY (email, asset_id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, name TEXT, created_at TIMESTAMP, last_alert_check TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS assets (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, asset_name TEXT, asset_type TEXT, location TEXT, created_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS asset_metadata (id INTEGER PRIMARY KEY AUTOINCREMENT, asset_id INTEGER, metadata TEXT, FOREIGN KEY(asset_id) REFERENCES assets(id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, asset_id INTEGER, cve_id TEXT, sent_at TIMESTAMP, status TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS connections (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, source_asset_id INTEGER, target_asset_id INTEGER, relationship_type TEXT, created_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS asset_types (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, type_name TEXT, is_default INTEGER, created_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS node_positions (email TEXT, asset_id INTEGER, x REAL, y REAL, last_updated TIMESTAMP, PRIMARY KEY (email, asset_id))''')
     conn.commit()
-    # Pre‑populate default asset types
     default_types = ["PLC", "RTU", "HMI", "SCADA", "Gateway", "IED", "VFD", "UPS", "Historian", "Engineering Workstation"]
     for dt in default_types:
         c.execute("SELECT id FROM asset_types WHERE email IS NULL AND type_name=? AND is_default=1", (dt,))
         if not c.fetchone():
-            c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (NULL, ?, 1, ?)",
-                      (dt, datetime.now()))
+            c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (NULL, ?, 1, ?)", (dt, datetime.now()))
     conn.commit()
     conn.close()
 
@@ -214,7 +135,7 @@ def send_email(to_email, subject, body):
 def safe_float(x):
     try:
         return float(x)
-    except (ValueError, TypeError):
+    except:
         return 0.0
 
 def ensure_user(email):
@@ -222,8 +143,7 @@ def ensure_user(email):
     c = conn.cursor()
     c.execute("SELECT email FROM users WHERE email=?", (email,))
     if not c.fetchone():
-        c.execute("INSERT INTO users (email, name, created_at, last_alert_check) VALUES (?, ?, ?, ?)",
-                  (email, "", datetime.now(), None))
+        c.execute("INSERT INTO users (email, name, created_at, last_alert_check) VALUES (?, ?, ?, ?)", (email, "", datetime.now(), None))
         conn.commit()
     conn.close()
 
@@ -247,8 +167,7 @@ def add_asset_type(email, type_name):
     if c.fetchone():
         conn.close()
         return False
-    c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (?, ?, 0, ?)",
-              (email, type_name, datetime.now()))
+    c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (?, ?, 0, ?)", (email, type_name, datetime.now()))
     conn.commit()
     conn.close()
     return True
@@ -274,12 +193,10 @@ def add_asset(email, asset_name, asset_type, location, metadata=None):
         return False, None
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-    c.execute("INSERT INTO assets (email, asset_name, asset_type, location, created_at) VALUES (?, ?, ?, ?, ?)",
-              (email, asset_name, asset_type, location, datetime.now()))
+    c.execute("INSERT INTO assets (email, asset_name, asset_type, location, created_at) VALUES (?, ?, ?, ?, ?)", (email, asset_name, asset_type, location, datetime.now()))
     asset_id = c.lastrowid
     if metadata:
-        c.execute("INSERT INTO asset_metadata (asset_id, metadata) VALUES (?, ?)",
-                  (asset_id, json.dumps(metadata)))
+        c.execute("INSERT INTO asset_metadata (asset_id, metadata) VALUES (?, ?)", (asset_id, json.dumps(metadata)))
     conn.commit()
     conn.close()
     return True, asset_id
@@ -336,13 +253,11 @@ def add_connection(email, source_id, target_id, rel_type):
         return False
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-    c.execute("SELECT id FROM connections WHERE email=? AND source_asset_id=? AND target_asset_id=?",
-              (email, source_id, target_id))
+    c.execute("SELECT id FROM connections WHERE email=? AND source_asset_id=? AND target_asset_id=?", (email, source_id, target_id))
     if c.fetchone():
         conn.close()
         return False
-    c.execute("INSERT INTO connections (email, source_asset_id, target_asset_id, relationship_type, created_at) VALUES (?, ?, ?, ?, ?)",
-              (email, source_id, target_id, rel_type, datetime.now()))
+    c.execute("INSERT INTO connections (email, source_asset_id, target_asset_id, relationship_type, created_at) VALUES (?, ?, ?, ?, ?)", (email, source_id, target_id, rel_type, datetime.now()))
     conn.commit()
     conn.close()
     return True
@@ -384,8 +299,7 @@ def save_node_positions(email, positions):
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     for asset_id, (x, y) in positions.items():
-        c.execute("REPLACE INTO node_positions (email, asset_id, x, y, last_updated) VALUES (?, ?, ?, ?, ?)",
-                  (email, asset_id, x, y, datetime.now()))
+        c.execute("REPLACE INTO node_positions (email, asset_id, x, y, last_updated) VALUES (?, ?, ?, ?, ?)", (email, asset_id, x, y, datetime.now()))
     conn.commit()
     conn.close()
 
@@ -407,7 +321,7 @@ def delete_node_positions(email):
     conn.commit()
     conn.close()
 
-# ---------- Vulnerability Analysis Functions (Enhanced with Metadata) ----------
+# ---------- Vulnerability Analysis Functions ----------
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_nvd_cve(cve_id: str) -> Optional[Dict]:
     url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
@@ -423,13 +337,8 @@ def fetch_nvd_cve(cve_id: str) -> Optional[Dict]:
                 score = cvss_v3.get("baseScore", "N/A")
                 exploitability = cvss_v3.get("exploitabilityScore", "N/A")
                 desc = vuln.get("descriptions", [{}])[0].get("value", "")
-                return {
-                    "cve": cve_id,
-                    "cvss_score": score,
-                    "exploitability_score": exploitability,
-                    "description": desc,
-                }
-    except Exception:
+                return {"cve": cve_id, "cvss_score": score, "exploitability_score": exploitability, "description": desc}
+    except:
         pass
     return None
 
@@ -442,7 +351,7 @@ def fetch_epss(cve_id: str) -> Optional[float]:
             data = resp.json()
             if data.get("data"):
                 return float(data["data"][0]["epss"])
-    except Exception:
+    except:
         pass
     return None
 
@@ -453,7 +362,7 @@ def fetch_kev_catalog() -> List[Dict]:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             return resp.json().get("vulnerabilities", [])
-    except Exception:
+    except:
         pass
     return []
 
@@ -480,27 +389,18 @@ def get_past_likelihood(exploitability_score, in_kev: bool) -> str:
     return "Unknown"
 
 def build_asset_search_query(asset_name, asset_type, metadata):
-    """
-    Build a search string for NVD using asset details.
-    Includes: asset_name, asset_type, vendor, model, firmware (if present).
-    """
     terms = []
     if asset_name and asset_name != "nan":
         terms.append(asset_name)
     if asset_type and asset_type != "nan":
         terms.append(asset_type)
     if metadata:
-        if metadata.get("vendor"):
-            terms.append(metadata["vendor"])
-        if metadata.get("model"):
-            terms.append(metadata["model"])
-        if metadata.get("firmware"):
-            terms.append(metadata["firmware"])
-    # Remove duplicates and empty strings
-    terms = list(dict.fromkeys([t.strip() for t in terms if t and t != "nan"]))
-    # Join with spaces
+        for key in ["vendor", "model", "firmware"]:
+            val = metadata.get(key)
+            if val and val != "nan":
+                terms.append(val)
+    terms = list(dict.fromkeys([t.strip() for t in terms if t]))
     query = " ".join(terms)
-    # Boost OT context
     ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
     if any(term in query.lower() for term in ot_terms):
         query += " ics"
@@ -508,14 +408,11 @@ def build_asset_search_query(asset_name, asset_type, metadata):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> List[Dict]:
-    """Search NVD with a constructed query."""
     max_results = int(max_results)
     results = []
     start_index = 0
-
     start_date = datetime.now() - timedelta(days=lookback_months * 30)
     end_date = datetime.now()
-
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         params = {
@@ -525,7 +422,6 @@ def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> List[
             "startIndex": start_index,
             "resultsPerPage": min(50, max_results - len(results)),
         }
-
         headers = {"apiKey": NVD_API_KEY} if NVD_API_KEY else {}
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=10)
@@ -536,11 +432,7 @@ def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> List[
                     break
                 for item in vulns:
                     cve = item["cve"]
-                    results.append({
-                        "cve": cve["id"],
-                        "description": cve["descriptions"][0]["value"],
-                        "published": cve["published"],
-                    })
+                    results.append({"cve": cve["id"], "description": cve["descriptions"][0]["value"], "published": cve["published"]})
                 total = data.get("totalResults", 0)
                 start_index += len(vulns)
                 if start_index >= total:
@@ -565,29 +457,19 @@ def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
     past_likelihood = get_past_likelihood(nvd["exploitability_score"], in_kev)
     try:
         cvss = float(nvd["cvss_score"])
-    except (ValueError, TypeError):
+    except:
         cvss = "N/A"
-    return {
-        "cve": cve_id,
-        "cvss_score": cvss,
-        "epss": epss,
-        "kev": in_kev,
-        "past_likelihood": past_likelihood,
-        "description": nvd["description"]
-    }
+    return {"cve": cve_id, "cvss_score": cvss, "epss": epss, "kev": in_kev, "past_likelihood": past_likelihood, "description": nvd["description"]}
 
 # ---------- Alert Check ----------
 def check_new_alerts(user_email, lookback_months):
     assets = get_user_assets(user_email)
     if not assets:
         return False, "No assets to check."
-
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("SELECT last_alert_check FROM users WHERE email=?", (user_email,))
     row = c.fetchone()
-    last_check = row[0] if row else None
-
     kev_list = fetch_kev_catalog()
     new_alerts = []
     for asset_id, asset_name, asset_type, location, _ in assets:
@@ -600,19 +482,11 @@ def check_new_alerts(user_email, lookback_months):
             if not c.fetchone():
                 enriched = enrich_cve(cve_id, kev_list)
                 if enriched:
-                    new_alerts.append({
-                        "asset": asset_name,
-                        "cve": cve_id,
-                        "cvss": enriched["cvss_score"],
-                        "kev": enriched["kev"],
-                        "description": enriched["description"][:200]
-                    })
-                    c.execute("INSERT INTO alerts (email, asset_id, cve_id, sent_at, status) VALUES (?, ?, ?, ?, ?)",
-                              (user_email, asset_id, cve_id, datetime.now(), "sent"))
+                    new_alerts.append({"asset": asset_name, "cve": cve_id, "cvss": enriched["cvss_score"], "kev": enriched["kev"], "description": enriched["description"][:200]})
+                    c.execute("INSERT INTO alerts (email, asset_id, cve_id, sent_at, status) VALUES (?, ?, ?, ?, ?)", (user_email, asset_id, cve_id, datetime.now(), "sent"))
         time.sleep(0.5)
-
     if new_alerts:
-        subject = f"New OT Vulnerability Alerts for Your Assets"
+        subject = "New OT Vulnerability Alerts for Your Assets"
         body = f"Dear user,\n\nWe found {len(new_alerts)} new vulnerabilities affecting your assets:\n\n"
         for alert in new_alerts:
             body += f"- {alert['asset']}: {alert['cve']} (CVSS: {alert['cvss']}, KEV: {alert['kev']})\n  {alert['description']}\n\n"
@@ -628,18 +502,13 @@ def check_new_alerts(user_email, lookback_months):
         conn.close()
         return False, "No new vulnerabilities found."
 
-# ---------- LLM Agent ----------
+# ---------- LLM Agent (same as before, omitted for brevity) ----------
 def simple_llm_query(prompt: str) -> str:
     if not GROQ_API_KEY:
         return "Groq API key not configured."
     client = groq.Groq(api_key=GROQ_API_KEY)
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=500,
-        )
+        response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}], temperature=0.3, max_tokens=500)
         return response.choices[0].message.content
     except Exception as e:
         return f"Error: {e}"
@@ -647,99 +516,40 @@ def simple_llm_query(prompt: str) -> str:
 def agent_query(user_message: str, conversation_history: List[Dict], network_context: str = "") -> Tuple[str, List[Dict]]:
     if not GROQ_API_KEY:
         return "Groq API key not configured. AI Agent disabled.", conversation_history
-
     messages = []
     messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
-
-    system_prompt = {
-        "role": "system",
-        "content": f"""You are an OT/ICS cybersecurity analyst. You have access to tools to search for CVEs, get details, list KEV, and get ICS advisories.
+    system_prompt = {"role": "system", "content": f"""You are an OT/ICS cybersecurity analyst. You have access to tools to search for CVEs, get details, list KEV, and get ICS advisories.
 If the user asks about a specific asset, use the network architecture information provided below to understand upstream/downstream dependencies and predict impact propagation.
 
 Network Architecture:
 {network_context}
 
-When using tools, ensure numeric parameters are integers (no quotes). Consider OT/ICS implications and network dependencies in your answers."""
-    }
+When using tools, ensure numeric parameters are integers (no quotes). Consider OT/ICS implications and network dependencies in your answers."""}
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
-
     tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "search_vulnerabilities",
-                "description": "Search for vulnerabilities by keyword, with optional OT focus.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "keyword": {"type": "string", "description": "Search term"},
-                        "max_results": {"type": "integer", "description": "Max CVEs to return (default 10)"}
-                    },
-                    "required": ["keyword"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_cve_details",
-                "description": "Get full details of a specific CVE.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"cve_id": {"type": "string", "description": "CVE ID"}},
-                    "required": ["cve_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_kev_catalog",
-                "description": "List CVEs in CISA KEV catalog.",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_ics_advisories",
-                "description": "Get recent ICS-CERT advisories.",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        }
+        {"type": "function", "function": {"name": "search_vulnerabilities", "description": "Search for vulnerabilities by keyword, with optional OT focus.", "parameters": {"type": "object", "properties": {"keyword": {"type": "string", "description": "Search term"}, "max_results": {"type": "integer", "description": "Max CVEs to return (default 10)"}}, "required": ["keyword"]}}},
+        {"type": "function", "function": {"name": "get_cve_details", "description": "Get full details of a specific CVE.", "parameters": {"type": "object", "properties": {"cve_id": {"type": "string", "description": "CVE ID"}}, "required": ["cve_id"]}}},
+        {"type": "function", "function": {"name": "list_kev_catalog", "description": "List CVEs in CISA KEV catalog.", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "get_ics_advisories", "description": "Get recent ICS-CERT advisories.", "parameters": {"type": "object", "properties": {}}}}
     ]
-
     max_iterations = 10
     iteration = 0
-
     while iteration < max_iterations:
         client = groq.Groq(api_key=GROQ_API_KEY)
         try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.2,
-                max_tokens=1024,
-            )
+            response = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=messages, tools=tools, tool_choice="auto", temperature=0.2, max_tokens=1024)
             assistant_message = response.choices[0].message
         except Exception as e:
             return f"Error calling LLM: {e}", conversation_history
-
         if assistant_message.tool_calls:
             messages.append(assistant_message)
             for tool_call in assistant_message.tool_calls:
                 tool_name = tool_call.function.name
                 arguments = json.loads(tool_call.function.arguments)
                 tool_result = execute_tool(tool_name, arguments)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result,
-                })
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
             iteration += 1
             continue
         else:
@@ -747,7 +557,6 @@ When using tools, ensure numeric parameters are integers (no quotes). Consider O
             conversation_history.append({"role": "user", "content": user_message})
             conversation_history.append({"role": "assistant", "content": final_answer})
             return final_answer, conversation_history
-
     final_message = "I'm sorry, I couldn't resolve your request. Please try again."
     conversation_history.append({"role": "user", "content": user_message})
     conversation_history.append({"role": "assistant", "content": final_message})
@@ -762,7 +571,6 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
             max_results = int(max_results)
         except:
             max_results = 10
-        # For a generic search, we just use the keyword directly
         basic_results = search_nvd(keyword, lookback_months, max_results=max_results)
         if not basic_results:
             return f"No vulnerabilities found for '{keyword}'."
@@ -775,7 +583,6 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
         if not enriched:
             return f"Could not enrich CVEs for '{keyword}'."
         return json.dumps(enriched, indent=2)
-
     elif tool_name == "get_cve_details":
         cve_id = arguments["cve_id"]
         kev_list = fetch_kev_catalog()
@@ -783,21 +590,18 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
         if not enriched:
             return f"CVE {cve_id} not found."
         return json.dumps(enriched, indent=2)
-
     elif tool_name == "list_kev_catalog":
         kev_list = fetch_kev_catalog()
         if not kev_list:
             return "No KEV entries found."
         short_list = [{"cve": item.get("cveID"), "description": item.get("shortDescription", "")[:100]} for item in kev_list[:20]]
         return json.dumps(short_list, indent=2)
-
     elif tool_name == "get_ics_advisories":
         advisories = fetch_ics_advisories()
         if not advisories:
             return "No ICS advisories found."
         short_list = [{"title": a.get("title"), "id": a.get("icsa"), "date": a.get("releaseDate")} for a in advisories[:10]]
         return json.dumps(short_list, indent=2)
-
     else:
         return f"Unknown tool: {tool_name}"
 
@@ -808,7 +612,7 @@ def fetch_ics_advisories() -> List[Dict]:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             return resp.json().get("advisories", [])
-    except Exception:
+    except:
         pass
     return []
 
@@ -820,9 +624,11 @@ def analyze_assets(user_email, lookback_months):
 
     kev_list = fetch_kev_catalog()
     all_vulns = []
+    debug_queries = []
     for asset_id, asset_name, asset_type, location, _ in assets:
         metadata = get_asset_metadata(asset_id)
         query = build_asset_search_query(asset_name, asset_type, metadata)
+        debug_queries.append((asset_name, query))
         cve_list = search_nvd(query, lookback_months, max_results=20)
         for item in cve_list:
             enriched = enrich_cve(item["cve"], kev_list)
@@ -835,13 +641,14 @@ def analyze_assets(user_email, lookback_months):
                 enriched["firmware"] = metadata.get("firmware", "")
                 all_vulns.append(enriched)
 
+    st.session_state.debug_queries = debug_queries
+
     df = pd.DataFrame(all_vulns)
     if df.empty:
         return df, {}
 
     df["cvss_score"] = df["cvss_score"].apply(safe_float)
     df["epss"] = df["epss"].fillna(0).apply(safe_float)
-
     df["risk"] = df.apply(lambda x: "Critical" if x["kev"] else ("High" if x["cvss_score"] > 7 else ("Medium" if x["cvss_score"] > 4 else "Low")), axis=1)
 
     stats = {
@@ -859,14 +666,8 @@ def analyze_assets(user_email, lookback_months):
 def get_asset_epss_summary(user_email, df):
     if df.empty:
         return pd.DataFrame()
-    agg = df.groupby("asset").agg(
-        max_epss=("epss", "max"),
-        avg_epss=("epss", "mean"),
-        high_risk_count=("epss", lambda x: (x > 0.5).sum())
-    ).reset_index()
-    agg["risk_level"] = agg["max_epss"].apply(
-        lambda x: "Very High" if x > 0.8 else ("High" if x > 0.5 else ("Medium" if x > 0.2 else "Low"))
-    )
+    agg = df.groupby("asset").agg(max_epss=("epss", "max"), avg_epss=("epss", "mean"), high_risk_count=("epss", lambda x: (x > 0.5).sum())).reset_index()
+    agg["risk_level"] = agg["max_epss"].apply(lambda x: "Very High" if x > 0.8 else ("High" if x > 0.5 else ("Medium" if x > 0.2 else "Low")))
     return agg.sort_values("max_epss", ascending=False)
 
 def get_latest_cves_for_assets(user_email, lookback_months, limit=5):
@@ -896,7 +697,6 @@ def plot_network_graph(email, type_colors, pos=None, seed=None):
     G = build_network_graph(email)
     if G.number_of_nodes() == 0:
         return None, {}
-
     if pos is None:
         if seed is None:
             seed = 42
@@ -905,27 +705,14 @@ def plot_network_graph(email, type_colors, pos=None, seed=None):
         for node in G.nodes():
             if node not in pos:
                 pos[node] = (random.uniform(-1,1), random.uniform(-1,1))
-
-    edge_x = []
-    edge_y = []
+    edge_x, edge_y = [], []
     for edge in G.edges():
         x0, y0 = pos[edge[0]]
         x1, y1 = pos[edge[1]]
         edge_x.extend([x0, x1, None])
         edge_y.extend([y0, y1, None])
-
-    edge_trace = go.Scatter(
-        x=edge_x, y=edge_y,
-        line=dict(width=1.5, color='#888'),
-        hoverinfo='none',
-        mode='lines'
-    )
-
-    node_x = []
-    node_y = []
-    node_text = []
-    node_colors = []
-    node_sizes = []
+    edge_trace = go.Scatter(x=edge_x, y=edge_y, line=dict(width=1.5, color='#888'), hoverinfo='none', mode='lines')
+    node_x, node_y, node_text, node_colors, node_sizes = [], [], [], [], []
     for node in G.nodes():
         x, y = pos[node]
         node_x.append(x)
@@ -935,39 +722,14 @@ def plot_network_graph(email, type_colors, pos=None, seed=None):
         color = type_colors.get(asset_type, "#aaaaaa")
         node_colors.append(color)
         node_sizes.append(40)
-        node_text.append(
-            f"<b>{node_data['name']}</b><br>Type: {asset_type}<br>Location: {node_data['location']}"
-        )
-
-    node_trace = go.Scatter(
-        x=node_x, y=node_y,
-        mode='markers+text',
-        text=node_text,
-        textposition="top center",
-        hoverinfo='text',
-        marker=dict(
-            size=node_sizes,
-            color=node_colors,
-            line=dict(width=2, color='white')
-        )
-    )
-
+        node_text.append(f"<b>{node_data['name']}</b><br>Type: {asset_type}<br>Location: {node_data['location']}")
+    node_trace = go.Scatter(x=node_x, y=node_y, mode='markers+text', text=node_text, textposition="top center", hoverinfo='text', marker=dict(size=node_sizes, color=node_colors, line=dict(width=2, color='white')))
     fig = go.Figure(data=[edge_trace, node_trace])
-    fig.update_layout(
-        title=None,
-        showlegend=False,
-        hovermode='closest',
-        margin=dict(b=20, l=20, r=20, t=20),
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]),
-        plot_bgcolor='white',
-        paper_bgcolor='white'
-    )
+    fig.update_layout(title=None, showlegend=False, hovermode='closest', margin=dict(b=20, l=20, r=20, t=20), xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]), yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-1.5, 1.5]), plot_bgcolor='white', paper_bgcolor='white')
     return fig, pos
 
 # ---------- Main App ----------
 def main():
-    # Sidebar: Email input and lookback
     with st.sidebar:
         st.markdown("### 📧 Your Email")
         email = st.text_input("Email for alerts", value=st.session_state.get("user_email", ""), key="user_email_input")
@@ -979,7 +741,6 @@ def main():
                 st.rerun()
             else:
                 st.error("Please enter a valid email address.")
-
         if "user_email" in st.session_state:
             st.markdown(f"**Active email:** {st.session_state.user_email}")
             if st.button("Change Email"):
@@ -987,11 +748,9 @@ def main():
                 st.rerun()
         else:
             st.info("Enter your email to start.")
-
         st.markdown("---")
         st.markdown("### 🔍 Vulnerability Lookback")
-        lookback_months = st.slider("Months of data to analyze", min_value=1, max_value=60, value=24, step=1,
-                                    help="How many months back to search for CVEs")
+        lookback_months = st.slider("Months of data to analyze", min_value=1, max_value=60, value=24, step=1, help="How many months back to search for CVEs")
         if "lookback_months" not in st.session_state or st.session_state.lookback_months != lookback_months:
             st.session_state.lookback_months = lookback_months
             st.cache_data.clear()
@@ -1044,6 +803,15 @@ def main():
             st.warning("No assets found. Please add assets in the Asset Manager.")
             return
 
+        # Debug expander
+        with st.expander("🔍 Search Query Debug (first 5 assets)"):
+            if "debug_queries" in st.session_state:
+                for name, q in st.session_state.debug_queries[:5]:
+                    st.write(f"**{name}**: `{q}`")
+                st.caption("If a query returns no results, try increasing the lookback period or simplifying the asset details (e.g., use only vendor and model).")
+            else:
+                st.write("No queries recorded yet. Run a fresh analysis.")
+
         if df.empty:
             st.info(f"✅ Your assets have been imported. No CVEs found in the last {lookback} months.")
             st.subheader("Your Assets")
@@ -1062,54 +830,33 @@ def main():
         with col4:
             st.markdown(f'<div class="metric-card"><div class="stat-label">Assets Affected</div><div class="stat-value">{stats["assets_affected"]}</div></div>', unsafe_allow_html=True)
 
-        # Severity distribution chart
         st.subheader("Risk Severity Distribution")
-        severity_data = pd.DataFrame({
-            "Severity": ["Critical", "High", "Medium", "Low"],
-            "Count": [stats["critical_count"], stats["high_count"], stats["medium_count"], stats["low_count"]]
-        })
-        fig = px.bar(severity_data, x="Severity", y="Count", color="Severity",
-                     color_discrete_map={"Critical": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"},
-                     title="")
+        severity_data = pd.DataFrame({"Severity": ["Critical", "High", "Medium", "Low"], "Count": [stats["critical_count"], stats["high_count"], stats["medium_count"], stats["low_count"]]})
+        fig = px.bar(severity_data, x="Severity", y="Count", color="Severity", color_discrete_map={"Critical": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"}, title="")
         st.plotly_chart(fig, use_container_width=True)
 
-        # CVSS vs EPSS scatter plot
         st.subheader("CVSS vs EPSS Risk Matrix")
-        fig2 = px.scatter(df, x="cvss_score", y="epss", hover_name="cve", color="risk",
-                          color_discrete_map={"Critical": "red", "High": "orange", "Medium": "yellow", "Low": "green"},
-                          title="")
+        fig2 = px.scatter(df, x="cvss_score", y="epss", hover_name="cve", color="risk", color_discrete_map={"Critical": "red", "High": "orange", "Medium": "yellow", "Low": "green"}, title="")
         st.plotly_chart(fig2, use_container_width=True)
 
-        # Top assets by vulnerability count
         st.subheader("Top Assets by Vulnerability Count")
         asset_counts = df.groupby("asset").size().reset_index(name="count")
-        fig3 = px.bar(asset_counts.sort_values("count", ascending=False).head(10),
-                      x="asset", y="count", title="")
+        fig3 = px.bar(asset_counts.sort_values("count", ascending=False).head(10), x="asset", y="count", title="")
         st.plotly_chart(fig3, use_container_width=True)
 
-        # EPSS Proactive Analysis
         asset_epss = get_asset_epss_summary(user_email, df)
         if not asset_epss.empty:
             st.subheader("🚨 Assets with Highest Exploitation Probability (EPSS)")
             col1, col2 = st.columns([2, 1])
             with col1:
-                fig_epss = px.bar(asset_epss.head(10), x="asset", y="max_epss",
-                                  color="risk_level",
-                                  color_discrete_map={"Very High": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"},
-                                  title="Top 10 Assets by Max EPSS Score",
-                                  labels={"max_epss": "EPSS Score (0-1)", "asset": "Asset"})
+                fig_epss = px.bar(asset_epss.head(10), x="asset", y="max_epss", color="risk_level", color_discrete_map={"Very High": "#dc2626", "High": "#f97316", "Medium": "#eab308", "Low": "#10b981"}, title="Top 10 Assets by Max EPSS Score", labels={"max_epss": "EPSS Score (0-1)"})
                 st.plotly_chart(fig_epss, use_container_width=True)
             with col2:
                 st.markdown("**Why these assets are high risk:**")
                 if st.button("Generate AI Explanation", key="epss_btn"):
                     top_assets = asset_epss.head(5)["asset"].tolist()
                     vuln_data = df[df["asset"].isin(top_assets)][["asset", "cve", "epss", "description"]].head(20)
-                    prompt = f"""
-You are an OT cybersecurity analyst. Explain why the following assets are at high risk of exploitation in the next 30 days based on their EPSS scores. Provide a concise, actionable summary for the security team.
-
-Assets and their top vulnerabilities (EPSS > 0.5):
-{vuln_data.to_string()}
-"""
+                    prompt = f"You are an OT cybersecurity analyst. Explain why the following assets are at high risk of exploitation in the next 30 days based on their EPSS scores. Provide a concise, actionable summary for the security team.\n\nAssets and their top vulnerabilities (EPSS > 0.5):\n{vuln_data.to_string()}"
                     with st.spinner("Generating explanation..."):
                         explanation = simple_llm_query(prompt)
                         st.write(explanation)
@@ -1140,7 +887,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
         st.markdown('<div class="main-header">📦 Asset Manager</div>', unsafe_allow_html=True)
         st.markdown("Manage your OT assets and asset types.")
 
-        # Asset type management
+        # Asset type management (unchanged)
         with st.expander("🏷️ Manage Asset Types"):
             col1, col2 = st.columns(2)
             with col1:
@@ -1212,7 +959,6 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                         id_col = st.selectbox("Asset ID column (for connections)", ["-- Skip --"] + cols, index=0)
                     with col2:
                         conn_col = st.selectbox("Connections column (comma‑separated asset_ids)", ["-- Skip --"] + cols, index=0)
-                        # Additional OT columns
                         vendor_col = st.selectbox("Vendor column (optional)", ["-- Skip --"] + cols, index=0)
                         model_col = st.selectbox("Model column (optional)", ["-- Skip --"] + cols, index=0)
                         firmware_col = st.selectbox("Firmware column (optional)", ["-- Skip --"] + cols, index=0)
@@ -1232,7 +978,6 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                         duplicate_count = 0
                         type_list = get_asset_types(user_email)
 
-                        # First pass: add assets
                         for _, row in df.iterrows():
                             asset_name = str(row[name_col]).strip()
                             if not asset_name or asset_name == "nan":
@@ -1354,7 +1099,6 @@ Assets and their top vulnerabilities (EPSS > 0.5):
             type_colors = {t: color_palette[i % len(color_palette)] for i, t in enumerate(asset_types)}
             type_colors["Other"] = "#aaaaaa"
 
-            # Load saved positions
             asset_ids = [a[0] for a in assets]
             saved_pos = load_node_positions(user_email, asset_ids)
             if saved_pos:
@@ -1365,10 +1109,6 @@ Assets and their top vulnerabilities (EPSS > 0.5):
             fig, current_pos = plot_network_graph(user_email, type_colors, pos=pos, seed=st.session_state.get("graph_seed", 42))
             if fig:
                 col1, col2, col3 = st.columns(3)
-                with col1:
-                    # For simplicity, we use a session-only layout; saving positions would require JavaScript.
-                    # We'll keep the drag capability but not persistence for now.
-                    pass
                 with col2:
                     if st.button("🔄 Reset Layout"):
                         delete_node_positions(user_email)
@@ -1379,12 +1119,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                         st.rerun()
 
                 st.markdown('<div class="graph-container">', unsafe_allow_html=True)
-                st.plotly_chart(fig, use_container_width=True, config={
-                    'displayModeBar': True,
-                    'editable': True,          # allows dragging markers
-                    'scrollZoom': True,
-                    'doubleClick': 'reset+autosize'
-                })
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'editable': True, 'scrollZoom': True, 'doubleClick': 'reset+autosize'})
                 st.markdown('</div>', unsafe_allow_html=True)
                 st.caption("💡 Tip: You can drag nodes to any position. To reset, click 'Reset Layout'.")
             else:
@@ -1397,7 +1132,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
         if not GROQ_API_KEY:
             st.error("Groq API key not configured. AI Agent disabled.")
         else:
-            # Build network context string for the agent (including EPSS risk)
+            # Build network context
             network_context = ""
             G = build_network_graph(user_email)
             df, _ = analyze_assets(user_email, lookback)
