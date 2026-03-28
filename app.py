@@ -13,7 +13,6 @@ import sqlite3
 import smtplib
 import random
 import string
-import hashlib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Dict, List, Optional, Tuple
@@ -37,7 +36,7 @@ try:
 except:
     GROQ_API_KEY = None
 
-# Email settings
+# Email settings (for sending alerts)
 try:
     SMTP_SERVER = st.secrets["SMTP_SERVER"]
     SMTP_PORT = int(st.secrets["SMTP_PORT"])
@@ -121,26 +120,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Database Setup with Schema Upgrade ----------
+# ---------- Database Setup ----------
 def init_db():
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-
-    # Create users table with verified column if it doesn't exist
+    # Users table – now only stores email and last check time (no password)
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (email TEXT PRIMARY KEY,
-                  password TEXT,
                   name TEXT,
                   created_at TIMESTAMP,
                   last_alert_check TIMESTAMP)''')
-    # Add verified column if not present
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        # Column already exists – ignore
-        pass
-
-    # Create other tables
     c.execute('''CREATE TABLE IF NOT EXISTS assets
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   email TEXT,
@@ -168,13 +157,7 @@ def init_db():
                   type_name TEXT,
                   is_default INTEGER,
                   created_at TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS pending_verifications
-                 (email TEXT PRIMARY KEY,
-                  otp TEXT,
-                  name TEXT,
-                  password TEXT,
-                  created_at TIMESTAMP)''')
-
+    conn.commit()
     # Pre‑populate default asset types if not already present
     default_types = ["PLC", "RTU", "HMI", "SCADA", "Gateway", "IED", "VFD", "UPS", "Historian", "Engineering Workstation"]
     for dt in default_types:
@@ -182,7 +165,6 @@ def init_db():
         if not c.fetchone():
             c.execute("INSERT INTO asset_types (email, type_name, is_default, created_at) VALUES (NULL, ?, 1, ?)",
                       (dt, datetime.now()))
-
     conn.commit()
     conn.close()
 
@@ -208,105 +190,23 @@ def send_email(to_email, subject, body):
         st.error(f"Email error: {e}")
         return False
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def generate_otp():
-    return ''.join(random.choices(string.digits, k=6))
-
 def safe_float(x):
     try:
         return float(x)
     except (ValueError, TypeError):
         return 0.0
 
-# ---------- Authentication ----------
-def login_page():
-    st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
-    st.subheader("Secure Access")
-    tab1, tab2 = st.tabs(["Login", "Register"])
-
-    # --- Login ---
-    with tab1:
-        email = st.text_input("Email", key="login_email")
-        password = st.text_input("Password", type="password", key="login_password")
-        if st.button("Login"):
-            if not email or not password:
-                st.error("Please fill all fields.")
-            else:
-                conn = sqlite3.connect('ot_platform.db')
-                c = conn.cursor()
-                c.execute("SELECT email, password, verified FROM users WHERE email=?", (email,))
-                row = c.fetchone()
-                conn.close()
-                if row and row[1] == hash_password(password):
-                    if row[2] == 1:
-                        st.session_state.logged_in = True
-                        st.session_state.user_email = email
-                        st.rerun()
-                    else:
-                        st.error("Email not verified. Please complete registration.")
-                else:
-                    st.error("Invalid email or password.")
-
-    # --- Registration ---
-    with tab2:
-        name = st.text_input("Full Name", key="reg_name")
-        email = st.text_input("Email", key="reg_email")
-        password = st.text_input("Password", type="password", key="reg_password")
-        confirm = st.text_input("Confirm Password", type="password")
-
-        if st.button("Send OTP"):
-            if not name or not email or not password:
-                st.error("Please fill all fields.")
-            elif password != confirm:
-                st.error("Passwords do not match.")
-            else:
-                # Check if email already exists (verified user)
-                conn = sqlite3.connect('ot_platform.db')
-                c = conn.cursor()
-                c.execute("SELECT email FROM users WHERE email=? AND verified=1", (email,))
-                if c.fetchone():
-                    st.error("Email already registered.")
-                else:
-                    # Generate OTP and store in pending table
-                    otp = generate_otp()
-                    c.execute("REPLACE INTO pending_verifications (email, otp, name, password, created_at) VALUES (?, ?, ?, ?, ?)",
-                              (email, otp, name, hash_password(password), datetime.now()))
-                    conn.commit()
-                    # Send OTP email
-                    if send_email(email, "Verify your email", f"Your OTP is: {otp}"):
-                        st.success("OTP sent to your email. Please enter it below.")
-                        st.session_state.pending_email = email
-                        st.session_state.awaiting_otp = True
-                    else:
-                        st.error("Failed to send OTP. Check email settings.")
-                conn.close()
-
-        if st.session_state.get("awaiting_otp", False):
-            otp_input = st.text_input("Enter OTP", type="password", key="otp_input")
-            if st.button("Verify & Register"):
-                conn = sqlite3.connect('ot_platform.db')
-                c = conn.cursor()
-                c.execute("SELECT otp, name, password FROM pending_verifications WHERE email=?", (st.session_state.pending_email,))
-                row = c.fetchone()
-                if row and row[0] == otp_input:
-                    # Move to users table
-                    c.execute("INSERT INTO users (email, password, name, verified, created_at, last_alert_check) VALUES (?, ?, ?, 1, ?, ?)",
-                              (st.session_state.pending_email, row[2], row[1], datetime.now(), None))
-                    c.execute("DELETE FROM pending_verifications WHERE email=?", (st.session_state.pending_email,))
-                    conn.commit()
-                    st.success("Registration complete! You can now login.")
-                    st.session_state.awaiting_otp = False
-                    del st.session_state.pending_email
-                else:
-                    st.error("Invalid OTP.")
-                conn.close()
-
-def logout():
-    st.session_state.logged_in = False
-    st.session_state.user_email = None
-    st.rerun()
+# ---------- Ensure User in Database ----------
+def ensure_user(email):
+    """If user doesn't exist, create a record."""
+    conn = sqlite3.connect('ot_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT email FROM users WHERE email=?", (email,))
+    if not c.fetchone():
+        c.execute("INSERT INTO users (email, name, created_at, last_alert_check) VALUES (?, ?, ?, ?)",
+                  (email, "", datetime.now(), None))
+        conn.commit()
+    conn.close()
 
 # ---------- Asset Type Management ----------
 def get_asset_types(email):
@@ -561,17 +461,6 @@ def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
         "past_likelihood": past_likelihood,
         "description": nvd["description"]
     }
-
-def get_vulnerabilities_for_asset(asset_name, max_results=10):
-    kev_list = fetch_kev_catalog()
-    cve_list = search_nvd(asset_name, max_results=max_results)
-    enriched = []
-    for item in cve_list:
-        enriched_item = enrich_cve(item["cve"], kev_list)
-        if enriched_item:
-            enriched_item["asset"] = asset_name
-            enriched.append(enriched_item)
-    return enriched
 
 # ---------- Alert Check ----------
 def check_new_alerts(user_email):
@@ -943,24 +832,45 @@ def plot_network_graph(email, type_colors):
 
 # ---------- Main App ----------
 def main():
-    if "logged_in" not in st.session_state or not st.session_state.logged_in:
-        login_page()
+    # Sidebar: Email input
+    with st.sidebar:
+        st.markdown("### 📧 Your Email")
+        email = st.text_input("Email for alerts", value=st.session_state.get("user_email", ""), key="user_email_input")
+        if st.button("Set Email"):
+            if email and "@" in email:
+                st.session_state.user_email = email
+                ensure_user(email)
+                st.success(f"Email set to {email}")
+                st.rerun()
+            else:
+                st.error("Please enter a valid email address.")
+
+        if "user_email" in st.session_state:
+            st.markdown(f"**Active email:** {st.session_state.user_email}")
+            if st.button("Change Email"):
+                del st.session_state.user_email
+                st.rerun()
+        else:
+            st.info("Enter your email to start.")
+
+    # If no email set, show prompt and exit
+    if "user_email" not in st.session_state or not st.session_state.user_email:
+        st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
+        st.info("👋 Please enter your email in the sidebar to begin.")
         return
 
     user_email = st.session_state.user_email
 
-    # Sidebar
+    # Sidebar navigation (only shown when email is set)
     with st.sidebar:
+        st.markdown("---")
         st.markdown("### 🏭 Navigation")
         page = st.radio("", ["Dashboard", "Asset Manager", "Network Architecture", "AI Agent"])
-        st.markdown("---")
-        st.markdown(f"**Logged in as**  \n{user_email}")
-        if st.button("Logout"):
-            logout()
 
     if page == "Dashboard":
         st.markdown('<div class="main-header">📊 OT Vulnerability Dashboard</div>', unsafe_allow_html=True)
 
+        # On first load of the session, check for new alerts
         if "alert_checked" not in st.session_state:
             with st.spinner("Checking for new vulnerabilities..."):
                 _, msg = check_new_alerts(user_email)
@@ -981,7 +891,7 @@ def main():
             st.warning("No assets found. Please add assets in the Asset Manager.")
             return
 
-        # Metrics row
+        # Metrics row (same as before)
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.markdown('<div class="metric-card"><div class="stat-label">Total Vulnerabilities</div><div class="stat-value">{}</div></div>'.format(stats["total_vulns"]), unsafe_allow_html=True)
