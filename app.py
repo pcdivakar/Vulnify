@@ -117,6 +117,9 @@ def search_nvd(keyword: str, start_date: datetime, end_date: datetime, max_resul
     Search NVD with keyword and date range. Returns list of CVE summaries.
     Implements basic pagination.
     """
+    # Ensure max_results is integer (in case it's passed as string)
+    max_results = int(max_results)
+
     results = []
     start_index = 0
     while len(results) < max_results:
@@ -250,6 +253,11 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
     if tool_name == "search_cves":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
+        # Ensure max_results is integer
+        try:
+            max_results = int(max_results)
+        except:
+            max_results = 10
         results = search_nvd(keyword, datetime.now() - timedelta(days=365), datetime.now(), max_results)
         if not results:
             return f"No CVEs found for '{keyword}'."
@@ -340,7 +348,7 @@ Think step by step. Use tools only when necessary. Be concise but thorough.
         client = groq.Groq(api_key=GROQ_API_KEY)
         try:
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",   # Production model (replaces deprecated mixtral)
+                model="llama-3.3-70b-versatile",   # Production model
                 messages=messages,
                 temperature=0.2,
                 max_tokens=1024,
