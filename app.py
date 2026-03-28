@@ -499,12 +499,14 @@ def build_asset_search_query(asset_name, asset_type, metadata):
     return query
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> List[Dict]:
+def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> Tuple[List[Dict], int]:
+    """Return (list of CVEs, total results count)."""
     max_results = int(max_results)
     results = []
     start_index = 0
     start_date = datetime.now() - timedelta(days=lookback_months * 30)
     end_date = datetime.now()
+    total_count = 0
     while len(results) < max_results:
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
         params = {
@@ -519,6 +521,7 @@ def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> List[
             resp = requests.get(url, params=params, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
+                total_count = data.get("totalResults", 0)
                 vulns = data.get("vulnerabilities", [])
                 if not vulns:
                     break
@@ -529,20 +532,19 @@ def search_nvd(query: str, lookback_months: int, max_results: int = 50) -> List[
                         "description": cve["descriptions"][0]["value"],
                         "published": cve["published"],
                     })
-                total = data.get("totalResults", 0)
                 start_index += len(vulns)
-                if start_index >= total:
+                if start_index >= total_count:
                     break
                 time.sleep(0.2)
             elif resp.status_code == 404:
                 break
             else:
-                st.error(f"NVD search error {resp.status_code}")
+                st.error(f"NVD search error {resp.status_code} for query '{query}'")
                 break
         except Exception as e:
             st.error(f"Search error: {e}")
             break
-    return results[:max_results]
+    return results[:max_results], total_count
 
 def enrich_cve(cve_id: str, kev_list: List[Dict]) -> Dict:
     nvd = fetch_nvd_cve(cve_id)
@@ -581,7 +583,7 @@ def check_new_alerts(user_email, lookback_months):
     for asset_id, asset_name, asset_type, location, _ in assets:
         metadata = get_asset_metadata(asset_id)
         query = build_asset_search_query(asset_name, asset_type, metadata)
-        cve_list = search_nvd(query, lookback_months, max_results=20)
+        cve_list, _ = search_nvd(query, lookback_months, max_results=20)
         for item in cve_list:
             cve_id = item["cve"]
             c.execute("SELECT id FROM alerts WHERE email=? AND asset_id=? AND cve_id=?", (user_email, asset_id, cve_id))
@@ -750,7 +752,7 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
             max_results = int(max_results)
         except:
             max_results = 10
-        basic_results = search_nvd(keyword, lookback_months, max_results=max_results)
+        basic_results, _ = search_nvd(keyword, lookback_months, max_results=max_results)
         if not basic_results:
             return f"No vulnerabilities found for '{keyword}'."
         kev_list = fetch_kev_catalog()
@@ -803,16 +805,16 @@ def fetch_ics_advisories() -> List[Dict]:
 def analyze_assets(user_email, lookback_months):
     assets = get_user_assets(user_email)
     if not assets:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {}, []
 
     kev_list = fetch_kev_catalog()
     all_vulns = []
-    debug_queries = []
+    debug_info = []  # list of (asset_name, query, count)
     for asset_id, asset_name, asset_type, location, _ in assets:
         metadata = get_asset_metadata(asset_id)
         query = build_asset_search_query(asset_name, asset_type, metadata)
-        debug_queries.append((asset_name, query))
-        cve_list = search_nvd(query, lookback_months, max_results=20)
+        cve_list, total_count = search_nvd(query, lookback_months, max_results=20)
+        debug_info.append((asset_name, query, total_count))
         for item in cve_list:
             enriched = enrich_cve(item["cve"], kev_list)
             if enriched:
@@ -824,11 +826,9 @@ def analyze_assets(user_email, lookback_months):
                 enriched["firmware"] = metadata.get("firmware", "")
                 all_vulns.append(enriched)
 
-    st.session_state.debug_queries = debug_queries
-
     df = pd.DataFrame(all_vulns)
     if df.empty:
-        return df, {}
+        return df, {}, debug_info
 
     df["cvss_score"] = df["cvss_score"].apply(safe_float)
     df["epss"] = df["epss"].fillna(0).apply(safe_float)
@@ -845,7 +845,7 @@ def analyze_assets(user_email, lookback_months):
         "max_cvss": df["cvss_score"].max(),
         "assets_affected": df["asset"].nunique()
     }
-    return df, stats
+    return df, stats, debug_info
 
 def get_asset_epss_summary(user_email, df):
     if df.empty:
@@ -869,7 +869,7 @@ def get_latest_cves_for_assets(user_email, lookback_months, limit=5):
     for asset_id, asset_name, asset_type, location, _ in assets:
         metadata = get_asset_metadata(asset_id)
         query = build_asset_search_query(asset_name, asset_type, metadata)
-        cve_list = search_nvd(query, lookback_months, max_results=5)
+        cve_list, _ = search_nvd(query, lookback_months, max_results=5)
         for item in cve_list:
             enriched = enrich_cve(item["cve"], kev_list)
             if enriched:
@@ -981,12 +981,25 @@ def main():
 
         st.markdown("---")
         st.markdown("### 🔍 Vulnerability Lookback")
-        lookback_months = st.slider("Months of data to analyze", min_value=1, max_value=60, value=24, step=1,
+        lookback_months = st.slider("Months of data to analyze", min_value=1, max_value=120, value=60, step=1,
                                     help="How many months back to search for CVEs")
         if "lookback_months" not in st.session_state or st.session_state.lookback_months != lookback_months:
             st.session_state.lookback_months = lookback_months
             st.cache_data.clear()
             st.rerun()
+
+        st.markdown("---")
+        st.markdown("### 🧪 Manual Test Search")
+        test_query = st.text_input("Test query (e.g., 'Siemens S7-1200')")
+        if st.button("Test NVD Search"):
+            with st.spinner("Searching NVD..."):
+                results, total = search_nvd(test_query, lookback_months, max_results=5)
+                if results:
+                    st.success(f"Found {total} total CVEs. First 5:")
+                    for r in results:
+                        st.write(f"- {r['cve']}: {r['description'][:100]}...")
+                else:
+                    st.warning("No results. Check query or increase lookback.")
 
     if "user_email" not in st.session_state or not st.session_state.user_email:
         st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
@@ -1028,21 +1041,18 @@ def main():
                 st.session_state.alert_checked = True
 
         with st.spinner("Analyzing your assets..."):
-            df, stats = analyze_assets(user_email, lookback)
+            df, stats, debug_info = analyze_assets(user_email, lookback)
 
         assets = get_user_assets(user_email)
         if not assets:
             st.warning("No assets found. Please add assets in the Asset Manager.")
             return
 
-        # Debug expander to see search queries
+        # Debug expander to see search queries and results
         with st.expander("🔍 Search Query Debug (first 5 assets)"):
-            if "debug_queries" in st.session_state:
-                for name, q in st.session_state.debug_queries[:5]:
-                    st.write(f"**{name}**: `{q}`")
-                st.caption("If a query returns no results, try increasing the lookback period or simplifying the asset details (e.g., use only vendor and model).")
-            else:
-                st.write("No queries recorded yet. Run a fresh analysis.")
+            for name, query, count in debug_info[:5]:
+                st.write(f"**{name}**: `{query}` → {count} results")
+            st.caption("If a query returns zero results, try simplifying the query or increasing the lookback months.")
 
         if df.empty:
             st.info(f"✅ Your assets have been imported. No CVEs found in the last {lookback} months.")
@@ -1460,7 +1470,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
             # Build network context string for the agent (including EPSS risk)
             network_context = ""
             G = build_network_graph(user_email)
-            df, _ = analyze_assets(user_email, lookback)
+            df, _, _ = analyze_assets(user_email, lookback)
             asset_epss = get_asset_epss_summary(user_email, df) if not df.empty else pd.DataFrame()
 
             if G.number_of_nodes() > 0:
