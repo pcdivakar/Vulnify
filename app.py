@@ -129,6 +129,7 @@ def init_db():
                  (email TEXT PRIMARY KEY,
                   password TEXT,
                   name TEXT,
+                  verified INTEGER DEFAULT 0,
                   created_at TIMESTAMP,
                   last_alert_check TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS assets
@@ -157,6 +158,13 @@ def init_db():
                   email TEXT,
                   type_name TEXT,
                   is_default INTEGER,
+                  created_at TIMESTAMP)''')
+    # Table for temporary OTP storage
+    c.execute('''CREATE TABLE IF NOT EXISTS pending_verifications
+                 (email TEXT PRIMARY KEY,
+                  otp TEXT,
+                  name TEXT,
+                  password TEXT,
                   created_at TIMESTAMP)''')
     conn.commit()
     # Pre‑populate default asset types if not already present
@@ -194,6 +202,9 @@ def send_email(to_email, subject, body):
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
+def generate_otp():
+    return ''.join(random.choices(string.digits, k=6))
+
 def safe_float(x):
     try:
         return float(x)
@@ -205,7 +216,8 @@ def login_page():
     st.markdown('<div class="main-header">🏭 OT Vulnerability Intelligence Platform</div>', unsafe_allow_html=True)
     st.subheader("Secure Access")
     tab1, tab2 = st.tabs(["Login", "Register"])
-    
+
+    # --- Login ---
     with tab1:
         email = st.text_input("Email", key="login_email")
         password = st.text_input("Password", type="password", key="login_password")
@@ -215,37 +227,71 @@ def login_page():
             else:
                 conn = sqlite3.connect('ot_platform.db')
                 c = conn.cursor()
-                c.execute("SELECT email, password FROM users WHERE email=?", (email,))
+                c.execute("SELECT email, password, verified FROM users WHERE email=?", (email,))
                 row = c.fetchone()
                 conn.close()
                 if row and row[1] == hash_password(password):
-                    st.session_state.logged_in = True
-                    st.session_state.user_email = email
-                    st.rerun()
+                    if row[2] == 1:
+                        st.session_state.logged_in = True
+                        st.session_state.user_email = email
+                        st.rerun()
+                    else:
+                        st.error("Email not verified. Please complete registration.")
                 else:
                     st.error("Invalid email or password.")
-    
+
+    # --- Registration ---
     with tab2:
         name = st.text_input("Full Name", key="reg_name")
         email = st.text_input("Email", key="reg_email")
         password = st.text_input("Password", type="password", key="reg_password")
         confirm = st.text_input("Confirm Password", type="password")
-        if st.button("Register"):
+
+        if st.button("Send OTP"):
             if not name or not email or not password:
                 st.error("Please fill all fields.")
             elif password != confirm:
                 st.error("Passwords do not match.")
             else:
+                # Check if email already exists (verified user)
                 conn = sqlite3.connect('ot_platform.db')
                 c = conn.cursor()
-                c.execute("SELECT email FROM users WHERE email=?", (email,))
+                c.execute("SELECT email FROM users WHERE email=? AND verified=1", (email,))
                 if c.fetchone():
                     st.error("Email already registered.")
                 else:
-                    c.execute("INSERT INTO users (email, password, name, created_at, last_alert_check) VALUES (?, ?, ?, ?, ?)",
-                              (email, hash_password(password), name, datetime.now(), None))
+                    # Generate OTP and store in pending table
+                    otp = generate_otp()
+                    c.execute("REPLACE INTO pending_verifications (email, otp, name, password, created_at) VALUES (?, ?, ?, ?, ?)",
+                              (email, otp, name, hash_password(password), datetime.now()))
                     conn.commit()
-                    st.success("Registration successful! You can now login.")
+                    # Send OTP email
+                    if send_email(email, "Verify your email", f"Your OTP is: {otp}"):
+                        st.success("OTP sent to your email. Please enter it below.")
+                        st.session_state.pending_email = email
+                        st.session_state.awaiting_otp = True
+                    else:
+                        st.error("Failed to send OTP. Check email settings.")
+                conn.close()
+
+        if st.session_state.get("awaiting_otp", False):
+            otp_input = st.text_input("Enter OTP", type="password", key="otp_input")
+            if st.button("Verify & Register"):
+                conn = sqlite3.connect('ot_platform.db')
+                c = conn.cursor()
+                c.execute("SELECT otp, name, password FROM pending_verifications WHERE email=?", (st.session_state.pending_email,))
+                row = c.fetchone()
+                if row and row[0] == otp_input:
+                    # Move to users table
+                    c.execute("INSERT INTO users (email, password, name, verified, created_at, last_alert_check) VALUES (?, ?, ?, 1, ?, ?)",
+                              (st.session_state.pending_email, row[2], row[1], datetime.now(), None))
+                    c.execute("DELETE FROM pending_verifications WHERE email=?", (st.session_state.pending_email,))
+                    conn.commit()
+                    st.success("Registration complete! You can now login.")
+                    st.session_state.awaiting_otp = False
+                    del st.session_state.pending_email
+                else:
+                    st.error("Invalid OTP.")
                 conn.close()
 
 def logout():
@@ -255,25 +301,20 @@ def logout():
 
 # ---------- Asset Type Management ----------
 def get_asset_types(email):
-    """Return list of available asset types (default + user's custom)."""
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-    # Get default types (email IS NULL and is_default=1)
     c.execute("SELECT type_name FROM asset_types WHERE email IS NULL AND is_default=1 ORDER BY type_name")
     defaults = [row[0] for row in c.fetchall()]
-    # Get user's custom types
     c.execute("SELECT type_name FROM asset_types WHERE email=? AND is_default=0 ORDER BY type_name", (email,))
     customs = [row[0] for row in c.fetchall()]
     conn.close()
     return defaults + customs
 
 def add_asset_type(email, type_name):
-    """Add a custom asset type for the user."""
     if not type_name.strip():
         return False
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
-    # Check if already exists (default or user's)
     c.execute("SELECT id FROM asset_types WHERE (email IS NULL OR email=?) AND type_name=?", (email, type_name))
     if c.fetchone():
         conn.close()
@@ -285,7 +326,6 @@ def add_asset_type(email, type_name):
     return True
 
 def delete_asset_type(email, type_name):
-    """Delete a custom asset type (only allowed for user's own types, not defaults)."""
     conn = sqlite3.connect('ot_platform.db')
     c = conn.cursor()
     c.execute("DELETE FROM asset_types WHERE email=? AND type_name=? AND is_default=0", (email, type_name))
@@ -444,13 +484,11 @@ def search_nvd(keyword: str, start_date: Optional[datetime] = None, end_date: Op
     results = []
     start_index = 0
 
-    # If no dates provided, default to last 2 years (to show recent CVEs only)
     if start_date is None:
         start_date = datetime.now() - timedelta(days=730)
     if end_date is None:
         end_date = datetime.now()
 
-    # Enhance OT context
     ot_terms = ["ics", "scada", "plc", "rtu", "hmi", "modbus", "opc", "profibus", "fieldbus"]
     if any(term in keyword.lower() for term in ot_terms):
         keyword += " ics"
@@ -537,7 +575,6 @@ def check_new_alerts(user_email):
     c.execute("SELECT last_alert_check FROM users WHERE email=?", (user_email,))
     row = c.fetchone()
     last_check = row[0] if row else None
-    last_check_dt = datetime.fromisoformat(last_check) if last_check else None
 
     kev_list = fetch_kev_catalog()
     new_alerts = []
@@ -577,15 +614,14 @@ def check_new_alerts(user_email):
         conn.close()
         return False, "No new vulnerabilities found."
 
-# ---------- LLM Agent (without tool calls for explanation) ----------
+# ---------- LLM Agent ----------
 def simple_llm_query(prompt: str) -> str:
-    """Call LLM without tools (used for AI explanation)."""
     if not GROQ_API_KEY:
         return "Groq API key not configured."
     client = groq.Groq(api_key=GROQ_API_KEY)
     try:
         response = client.chat.completions.create(
-            model="mixtral-8x7b-32768",  # More reliable for simple prompts
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=500,
@@ -595,7 +631,6 @@ def simple_llm_query(prompt: str) -> str:
         return f"Error: {e}"
 
 def agent_query(user_message: str, conversation_history: List[Dict], network_context: str = "") -> Tuple[str, List[Dict]]:
-    """Full AI Agent with tools (used for chat)."""
     if not GROQ_API_KEY:
         return "Groq API key not configured. AI Agent disabled.", conversation_history
 
@@ -616,7 +651,6 @@ When using tools, ensure numeric parameters are integers (no quotes). Consider O
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, system_prompt)
 
-    # Tool definitions (same as before)
     tools = [
         {
             "type": "function",
@@ -670,7 +704,7 @@ When using tools, ensure numeric parameters are integers (no quotes). Consider O
         client = groq.Groq(api_key=GROQ_API_KEY)
         try:
             response = client.chat.completions.create(
-                model="mixtral-8x7b-32768",  # More reliable for tool calls
+                model="llama-3.3-70b-versatile",
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
@@ -686,7 +720,6 @@ When using tools, ensure numeric parameters are integers (no quotes). Consider O
             for tool_call in assistant_message.tool_calls:
                 tool_name = tool_call.function.name
                 arguments = json.loads(tool_call.function.arguments)
-                # Execute the tool (implemented earlier)
                 tool_result = execute_tool(tool_name, arguments)
                 messages.append({
                     "role": "tool",
@@ -707,7 +740,6 @@ When using tools, ensure numeric parameters are integers (no quotes). Consider O
     return final_message, conversation_history
 
 def execute_tool(tool_name: str, arguments: Dict) -> str:
-    """Re‑implement tool execution (needed for the agent)."""
     if tool_name == "search_vulnerabilities":
         keyword = arguments["keyword"]
         max_results = arguments.get("max_results", 10)
@@ -755,7 +787,6 @@ def execute_tool(tool_name: str, arguments: Dict) -> str:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_ics_advisories() -> List[Dict]:
-    """Fetch ICS-CERT advisories from CISA."""
     url = "https://www.cisa.gov/sites/default/files/feeds/ics-advisories.json"
     try:
         resp = requests.get(url, timeout=10)
@@ -805,7 +836,6 @@ def analyze_assets(user_email):
     return df, stats
 
 def get_asset_epss_summary(user_email, df):
-    """Return DataFrame with per‑asset EPSS statistics."""
     if df.empty:
         return pd.DataFrame()
     agg = df.groupby("asset").agg(
@@ -830,7 +860,6 @@ def get_latest_cves_for_assets(user_email, limit=5):
             enriched = enrich_cve(item["cve"], kev_list)
             if enriched:
                 enriched["asset"] = asset_name
-                # Convert cvss_score to float for sorting
                 try:
                     enriched["cvss_score"] = float(enriched["cvss_score"])
                 except:
@@ -840,12 +869,12 @@ def get_latest_cves_for_assets(user_email, limit=5):
     return all_cves[:limit]
 
 # ---------- Network Graph Visualization ----------
-def plot_network_graph(email):
+def plot_network_graph(email, type_colors):
     G = build_network_graph(email)
     if G.number_of_nodes() == 0:
         return None
 
-    pos = nx.spring_layout(G, k=1, iterations=50, seed=42)
+    pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
 
     edge_x = []
     edge_y = []
@@ -857,19 +886,26 @@ def plot_network_graph(email):
 
     edge_trace = go.Scatter(
         x=edge_x, y=edge_y,
-        line=dict(width=1, color='#888'),
+        line=dict(width=1.5, color='#888'),
         hoverinfo='none',
-        mode='lines')
+        mode='lines'
+    )
 
     node_x = []
     node_y = []
     node_text = []
+    node_colors = []
     for node in G.nodes():
         x, y = pos[node]
         node_x.append(x)
         node_y.append(y)
         node_data = G.nodes[node]
-        node_text.append(f"<b>{node_data['name']}</b><br>Type: {node_data['type']}<br>Location: {node_data['location']}")
+        asset_type = node_data['type']
+        color = type_colors.get(asset_type, "#aaaaaa")
+        node_colors.append(color)
+        node_text.append(
+            f"<b>{node_data['name']}</b><br>Type: {asset_type}<br>Location: {node_data['location']}"
+        )
 
     node_trace = go.Scatter(
         x=node_x, y=node_y,
@@ -878,21 +914,21 @@ def plot_network_graph(email):
         textposition="top center",
         hoverinfo='text',
         marker=dict(
-            size=30,
-            color='#3b82f6',
+            size=40,
+            color=node_colors,
             line=dict(width=2, color='white')
         )
     )
 
     fig = go.Figure(data=[edge_trace, node_trace])
     fig.update_layout(
-        title='Network Architecture',
-        title_font_size=16,
+        title=None,
         showlegend=False,
         hovermode='closest',
-        margin=dict(b=20, l=5, r=5, t=40),
+        margin=dict(b=20, l=20, r=20, t=20),
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        plot_bgcolor='white'
     )
     return fig
 
@@ -987,7 +1023,6 @@ def main():
             with col2:
                 st.markdown("**Why these assets are high risk:**")
                 if st.button("Generate AI Explanation", key="epss_btn"):
-                    # Fetch data directly (no tool call)
                     top_assets = asset_epss.head(5)["asset"].tolist()
                     vuln_data = df[df["asset"].isin(top_assets)][["asset", "cve", "epss", "description"]].head(20)
                     prompt = f"""
@@ -1116,26 +1151,47 @@ Assets and their top vulnerabilities (EPSS > 0.5):
 
     elif page == "Network Architecture":
         st.markdown('<div class="main-header">🔗 Network Architecture</div>', unsafe_allow_html=True)
-        st.markdown("Define connections between your OT assets to model upstream/downstream dependencies. The AI agent will use this to predict impact propagation.")
+        st.markdown("Define connections between your OT assets. The AI agent will use this to predict impact propagation.")
 
         assets = get_user_assets(user_email)
         if not assets:
             st.warning("Please add assets first in the Asset Manager.")
         else:
+            # Color map for asset types
+            asset_types = list(set([a[2] for a in assets]))
+            color_palette = px.colors.qualitative.Plotly + px.colors.qualitative.Dark24
+            type_colors = {t: color_palette[i % len(color_palette)] for i, t in enumerate(asset_types)}
+            type_colors["Other"] = "#aaaaaa"
+
+            # Graph visualization (scrollable)
+            st.subheader("Network Graph")
+            fig = plot_network_graph(user_email, type_colors)
+            if fig:
+                st.markdown(
+                    '<div style="height: 500px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 12px;">',
+                    unsafe_allow_html=True
+                )
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("Not enough nodes to display graph (need at least one asset).")
+
+            st.markdown("---")
+
             # Add connection
-            with st.expander("➕ Add Connection"):
+            with st.expander("➕ Add Connection", expanded=True):
                 col1, col2, col3 = st.columns(3)
-                asset_names = [f"{a[1]} (ID:{a[0]})" for a in assets]
-                asset_ids = {f"{name} (ID:{aid})": aid for aid, name, _, _, _ in assets}
+                asset_options = [f"{a[1]} (ID:{a[0]})" for a in assets]
+                asset_id_map = {opt: a[0] for opt, a in zip(asset_options, assets)}
                 with col1:
-                    source = st.selectbox("Source Asset", asset_names)
+                    source_opt = st.selectbox("Source Asset", asset_options, key="src_conn")
                 with col2:
-                    target = st.selectbox("Target Asset", asset_names)
+                    target_opt = st.selectbox("Target Asset", asset_options, key="tgt_conn")
                 with col3:
                     rel_type = st.selectbox("Relationship", ["upstream", "downstream", "peer"])
-                if st.button("Add Connection"):
-                    src_id = asset_ids[source]
-                    tgt_id = asset_ids[target]
+                if st.button("Create Connection", key="add_conn_btn"):
+                    src_id = asset_id_map[source_opt]
+                    tgt_id = asset_id_map[target_opt]
                     if src_id == tgt_id:
                         st.warning("Source and target cannot be the same.")
                     else:
@@ -1146,7 +1202,7 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                         else:
                             st.warning("Connection already exists.")
 
-            # List existing connections
+            # Existing connections
             connections = get_connections(user_email)
             if connections:
                 st.subheader("Existing Connections")
@@ -1158,21 +1214,16 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                 conn_df = pd.DataFrame(conn_data)
                 st.dataframe(conn_df, use_container_width=True)
 
-                del_id = st.number_input("Connection ID to delete", min_value=0, step=1)
-                if st.button("Delete Connection") and del_id > 0:
-                    delete_connection(del_id)
-                    st.success("Connection deleted.")
-                    st.rerun()
+                del_id = st.number_input("Connection ID to delete", min_value=0, step=1, key="del_conn_id")
+                if st.button("Delete Connection", key="del_conn_btn"):
+                    if del_id > 0 and del_id in conn_df["ID"].values:
+                        delete_connection(del_id)
+                        st.success("Connection deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Invalid Connection ID.")
             else:
                 st.info("No connections yet. Add some to model your network.")
-
-            # Visualize network
-            st.subheader("Network Graph")
-            fig = plot_network_graph(user_email)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Not enough nodes to display graph (need at least one asset).")
 
     elif page == "AI Agent":
         st.markdown('<div class="main-header">🤖 OT Vulnerability Agent</div>', unsafe_allow_html=True)
@@ -1193,7 +1244,6 @@ Assets and their top vulnerabilities (EPSS > 0.5):
                 for node in G.nodes():
                     node_data = G.nodes[node]
                     asset_name = node_data['name']
-                    # Get EPSS stats for this asset
                     if not asset_epss.empty:
                         asset_stats = asset_epss[asset_epss["asset"] == asset_name]
                         if not asset_stats.empty:
